@@ -21,54 +21,22 @@ Python 3.9+, stdlib only. Does not import co_plan_file.py.
 """
 
 import json
+import os
 import subprocess
 import sys
-import threading
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import cowork_ui as ui  # noqa: E402
+# Re-exported so existing callers/tests keep using bridge.USER_LABEL /
+# bridge.speaker_label; the canonical definitions live in cowork_ui.
+from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
 
 DEFAULT_ROLE_PROMPT = "roles/scout.md"
 
-
-USER_LABEL = "you › "      # "you › "
-
-
-def speaker_label(name):
-    return "%s › " % name   # "<name> › "
-
-
-class _Spinner:
-    """Minimal TTY spinner shown while waiting on a turn-based CLI (codex).
-    No-op when the output is not a real terminal."""
-
-    FRAMES = "|/-\\"
-
-    def __init__(self, out, label="working"):
-        self.out = out
-        self.label = label
-        self._stop = threading.Event()
-        self._thread = None
-        self._tty = bool(getattr(out, "isatty", lambda: False)())
-
-    def __enter__(self):
-        if self._tty:
-            self._thread = threading.Thread(target=self._spin, daemon=True)
-            self._thread.start()
-        return self
-
-    def _spin(self):
-        i = 0
-        while not self._stop.is_set():
-            self.out.write("\r%s %s…" % (self.FRAMES[i % len(self.FRAMES)], self.label))
-            self.out.flush()
-            i += 1
-            self._stop.wait(0.1)
-
-    def __exit__(self, *exc):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=1)
-        if self._tty:
-            self.out.write("\r\033[K")  # clear the spinner line
-            self.out.flush()
+# The spinner moved to cowork_ui (both bridges + the loop share it). Alias kept
+# for back-compat.
+_Spinner = ui.Spinner
 
 
 def _terminate(proc):
@@ -376,10 +344,15 @@ class ClaudeSession:
     """One persistent `claude -p` stream-json process; one turn per send()."""
 
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
-                 session_id=None, resume_id=None, on_session_id=None):
+                 session_id=None, resume_id=None, on_session_id=None,
+                 region_factory=None):
         self.io_out = io_out or sys.stdout
+        self.speaker = speaker
         self.label = speaker_label(speaker)
         self.on_session_id = on_session_id
+        # Markdown render region; injectable for tests. TTY: Rich Live streaming.
+        # Non-TTY: raw passthrough, byte-identical to the historical stream.
+        self._region_factory = region_factory or ui.StreamingMarkdown
         self._seen_session = False
         command = build_claude_command(role_prompt_file, mode, yolo,
                                        session_id=session_id, resume_id=resume_id)
@@ -389,12 +362,34 @@ class ClaudeSession:
         )
 
     def send(self, text):
-        """Send one user message and stream the labeled reply until the turn's
-        `result` event."""
+        """Send one user message and surface the labeled reply for one turn.
+
+        On a TTY a `scout working…` spinner fills the gap before the first token
+        (#13), then the reply renders **live** as markdown in a Rich region (#5) —
+        length-independent. Off a TTY the region is a raw passthrough, byte-for-byte
+        the historical token stream (so the streaming/test contract is unchanged)."""
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
-        streaming = False
+        tty = ui.is_tty(self.io_out)
         any_text = False
+        denied = False
+        region = None
+        spinner = ui.Spinner(self.io_out, "%s working" % self.speaker) if tty else None
+        if spinner:
+            spinner.start()
+
+        def _feed(chunk):
+            # Open the render region on the first token (after stopping the
+            # gap-filling spinner), then stream into it.
+            nonlocal region
+            if region is None:
+                if spinner:
+                    spinner.stop()
+                region = self._region_factory(
+                    self.io_out, ui.label(self.speaker, tty))
+                region.__enter__()
+            region.feed(chunk)
+
         for line in self.proc.stdout:
             line = line.strip()
             if not line:
@@ -403,14 +398,15 @@ class ClaudeSession:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # A new text block after we've already streamed text (e.g. the model
+            # A new text block after the model already produced text (e.g. it
             # resumed narration after a tool call) must be separated, else the
             # blocks abut with no space ("...off.Enough recon").
-            if obj.get("type") == "stream_event" and streaming:
+            if (obj.get("type") == "stream_event" and region is not None
+                    and region.buf):
                 ev = obj.get("event") or {}
                 if (ev.get("type") == "content_block_start"
                         and (ev.get("content_block") or {}).get("type") == "text"):
-                    self.io_out.write("\n\n")
+                    region.feed("\n\n")
             parsed = parse_claude_event(obj)
             sid = parsed.get("session_id")
             if sid and not self._seen_session and self.on_session_id:
@@ -418,21 +414,27 @@ class ClaudeSession:
                 self.on_session_id(sid)
             kind = parsed["kind"]
             if kind == "partial" and parsed.get("text"):
-                if not streaming:
-                    self.io_out.write("\n" + self.label)
-                    streaming = True
-                self.io_out.write(parsed["text"])
+                _feed(parsed["text"])
                 any_text = True
             elif kind == "assistant" and parsed.get("text") and not any_text:
-                self.io_out.write("\n" + self.label + parsed["text"])
+                _feed(parsed["text"])
                 any_text = True
             elif kind == "denied":
-                self.io_out.write("\n" + self.label + denial_message())
+                if spinner:
+                    spinner.stop()
+                denied = True
+                self.io_out.write("\n" + ui.label(self.speaker, tty) + denial_message())
             elif kind == "result":
-                if any_text:
+                if spinner:
+                    spinner.stop()
+                if region is not None:
+                    region.__exit__(None, None, None)  # finalize the render
+                elif denied:
                     self.io_out.write("\n")
                 if parsed.get("is_error"):
-                    self.io_out.write("[error] " + (parsed.get("text") or "") + "\n")
+                    self.io_out.write(
+                        ui.colorize("[error] " + (parsed.get("text") or ""),
+                                    ui.RED, tty) + "\n")
                 self.io_out.flush()
                 return
             self.io_out.flush()
@@ -468,6 +470,7 @@ class CodexSession:
             stderr=subprocess.DEVNULL, text=True,
         )
         events = []
+        tty = ui.is_tty(self.io_out)
         wrote_label = {"done": False}
         try:
             with _Spinner(self.io_out, label="%s working" % self.speaker) as spin:
@@ -482,20 +485,23 @@ class CodexSession:
                     events.append(obj)
                     parsed = parse_codex_event(obj)
 
-                    def _emit(text):
-                        spin.__exit__()
+                    def _emit(text, render=True):
+                        spin.stop()
                         if not wrote_label["done"]:
-                            self.io_out.write(self.label)
+                            self.io_out.write(ui.label(self.speaker, tty))
                             wrote_label["done"] = True
-                        self.io_out.write(text + "\n")
+                        if render:
+                            ui.render_markdown(self.io_out, text, enabled=tty)
+                        else:
+                            self.io_out.write(text + "\n")
                         self.io_out.flush()
 
                     if parsed["kind"] == "message" and parsed.get("text"):
                         _emit(parsed["text"])
                     elif parsed["kind"] == "denied":
-                        _emit(denial_message())
+                        _emit(denial_message(), render=False)
                     elif parsed["kind"] == "error":
-                        _emit("[error] " + (parsed.get("text") or ""))
+                        _emit("[error] " + (parsed.get("text") or ""), render=False)
             proc.wait()
         except KeyboardInterrupt:
             _terminate(proc)

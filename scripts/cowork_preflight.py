@@ -6,6 +6,7 @@ Additive to the co-plan skill; does not import or modify co_plan_file.py.
 Python 3.9+, stdlib only.
 """
 
+import importlib.util
 import shutil
 import sys
 
@@ -13,18 +14,23 @@ import sys
 # without forcing an upgrade. (co_plan_file.py keeps its own 3.10 requirement.)
 MIN_PY = (3, 9)
 
-# Exact install commands surfaced when a required tool is missing.
+# Exact install commands surfaced when a required CLI tool is missing.
 INSTALL_HINTS = {
     "claude": "npm install -g @anthropic-ai/claude-code",
     "codex": (
         "npm install -g @openai/codex   (Node 18+)\n"
         "    or: brew install --cask codex"
     ),
-    "gum": (
-        "brew install gum\n"
-        "    or see https://github.com/charmbracelet/gum#installation"
-    ),
 }
+
+# Python packages powering the interactive UX: prompt_toolkit (conversation
+# input), rich (streaming markdown + banners), questionary (menus + confirm).
+# Checked by import, not on PATH. Map import-name -> pip-name (identical here).
+PY_PACKAGES = ["rich", "prompt_toolkit", "questionary"]
+PY_PACKAGE_HINT = (
+    "pip install -r requirements.txt\n"
+    "    (or: pip install rich prompt_toolkit questionary)"
+)
 
 
 def check_python(version_info=sys.version_info):
@@ -71,13 +77,31 @@ def check_tools(tools, which=shutil.which):
 check_controllers = check_tools
 
 
+def check_python_packages(packages, find_spec=importlib.util.find_spec):
+    """Return (ok, [alerts]) for importable Python packages. `find_spec` is
+    injectable for tests (return None to simulate a missing package)."""
+    alerts = []
+    for pkg in packages:
+        try:
+            missing = find_spec(pkg) is None
+        except (ImportError, ValueError):
+            missing = True
+        if missing:
+            alerts.append(
+                "Required Python package %r not installed.\n    Install it with: %s"
+                % (pkg, PY_PACKAGE_HINT)
+            )
+    return (len(alerts) == 0), alerts
+
+
 def preflight(role_config, version_info=sys.version_info, which=shutil.which,
-              interactive=True):
+              interactive=True, find_spec=importlib.util.find_spec):
     """Run all preflight checks. Return (ok, [alerts]).
 
-    `gum` is required only for the interactive menus; the non-interactive args
-    path (--team/--config/--context) does not use it. Every alert is collected
-    so the user sees all problems at once.
+    The rich UX packages (rich/prompt_toolkit/questionary) are required only for
+    the interactive flow; the non-interactive args path (--team/--config/--context)
+    uses the plain readline fallback and needs none of them. Every alert is
+    collected so the user sees all problems at once.
     """
     alerts = []
     py_ok, py_alert = check_python(version_info)
@@ -85,12 +109,15 @@ def preflight(role_config, version_info=sys.version_info, which=shutil.which,
         alerts.append(py_alert)
 
     tools = list(required_controllers(role_config))
-    if interactive:
-        tools.append("gum")
     tools_ok, tool_alerts = check_tools(tools, which=which)
     alerts.extend(tool_alerts)
 
-    return (py_ok and tools_ok), alerts
+    pkg_ok = True
+    if interactive:
+        pkg_ok, pkg_alerts = check_python_packages(PY_PACKAGES, find_spec=find_spec)
+        alerts.extend(pkg_alerts)
+
+    return (py_ok and tools_ok and pkg_ok), alerts
 
 
 def main(argv=None):
