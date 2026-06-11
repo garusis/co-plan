@@ -28,6 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cowork_ui as ui  # noqa: E402
+import cowork_trace as trace_store  # noqa: E402
 # Re-exported so existing callers/tests keep using bridge.USER_LABEL /
 # bridge.speaker_label; the canonical definitions live in cowork_ui.
 from cowork_ui import USER_LABEL, speaker_label  # noqa: E402,F401
@@ -269,7 +270,8 @@ def denial_message():
 
 
 def probe_claude_stream_json(spawn, mode="plan", yolo=True,
-                             role_prompt_file=DEFAULT_ROLE_PROMPT):
+                             role_prompt_file=DEFAULT_ROLE_PROMPT, trace=None,
+                             role="scout"):
     """Send one minimal user message to claude and confirm an assistant/result
     event comes back.
 
@@ -279,18 +281,33 @@ def probe_claude_stream_json(spawn, mode="plan", yolo=True,
     """
     command = build_claude_command(role_prompt_file, mode, yolo)
     stdin_text = encode_user_message("ping")
+    if trace:
+        data = trace_store.command_meta(command)
+        data.update(trace_store.prompt_meta(stdin_text, prefix="stdin"))
+        trace.event("controller.probe.start", controller="claude", role=role,
+                    mode=mode, yolo=yolo, cwd=os.getcwd(),
+                    role_prompt_file=role_prompt_file, **data)
     try:
         events = spawn(command, stdin_text)
         for obj in events:
             kind = parse_claude_event(obj).get("kind")
             if kind in ("assistant", "result"):
+                if trace:
+                    trace.event("controller.probe.end", controller="claude",
+                                role=role, result="ok")
                 return True, None
     except Exception as exc:  # noqa: BLE001 - surface any spawn failure as an alert
+        if trace:
+            trace.event("controller.probe.end", controller="claude", role=role,
+                        result="error", error_type=type(exc).__name__)
         return False, (
             "Could not probe `claude` stream-json input (%s).\n"
             "    Confirm `claude` is installed and supports "
             "`--input-format stream-json`." % exc
         )
+    if trace:
+        trace.event("controller.probe.end", controller="claude", role=role,
+                    result="unsupported")
     return False, (
         "`claude` did not accept the cowork stream-json stdin message shape.\n"
         "    The stdin schema is undocumented (anthropics/claude-code #24594); "
@@ -345,21 +362,44 @@ class ClaudeSession:
 
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  session_id=None, resume_id=None, on_session_id=None,
-                 region_factory=None):
+                 region_factory=None, trace=None):
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
         self.on_session_id = on_session_id
+        self.trace = trace
+        self.mode = mode
+        self.yolo = yolo
+        self.role_prompt_file = role_prompt_file
+        self.session_id = session_id
+        self.resume_id = resume_id
         # Markdown render region; injectable for tests. TTY: Rich Live streaming.
         # Non-TTY: raw passthrough, byte-identical to the historical stream.
         self._region_factory = region_factory or ui.StreamingMarkdown
         self._seen_session = False
         command = build_claude_command(role_prompt_file, mode, yolo,
                                        session_id=session_id, resume_id=resume_id)
-        self.proc = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
-        )
+        if self.trace:
+            self.trace.event(
+                "controller.spawn.start", controller="claude", role=speaker,
+                fresh=not bool(resume_id), resume=bool(resume_id), mode=mode,
+                yolo=yolo, cwd=os.getcwd(), role_prompt_file=role_prompt_file,
+                session_id=session_id, resume_id=resume_id,
+                **trace_store.command_meta(command))
+        try:
+            self.proc = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if self.trace:
+                self.trace.event(
+                    "controller.spawn.end", controller="claude", role=speaker,
+                    result="error", error_type=type(exc).__name__)
+            raise
+        if self.trace:
+            self.trace.event("controller.spawn.end", controller="claude",
+                             role=speaker, result="ok")
 
     def send(self, text):
         """Send one user message and surface the labeled reply for one turn.
@@ -368,6 +408,10 @@ class ClaudeSession:
         (#13), then the reply renders **live** as markdown in a Rich region (#5) —
         length-independent. Off a TTY the region is a raw passthrough, byte-for-byte
         the historical token stream (so the streaming/test contract is unchanged)."""
+        if self.trace:
+            data = trace_store.prompt_meta(text)
+            self.trace.event("controller.turn.start", controller="claude",
+                             role=self.speaker, **data)
         self.proc.stdin.write(encode_user_message(text))
         self.proc.stdin.flush()
         tty = ui.is_tty(self.io_out)
@@ -411,6 +455,10 @@ class ClaudeSession:
             sid = parsed.get("session_id")
             if sid and not self._seen_session and self.on_session_id:
                 self._seen_session = True
+                if self.trace:
+                    self.trace.event("controller.session_id",
+                                     controller="claude", role=self.speaker,
+                                     session_id=sid)
                 self.on_session_id(sid)
             kind = parsed["kind"]
             if kind == "partial" and parsed.get("text"):
@@ -423,6 +471,9 @@ class ClaudeSession:
                 if spinner:
                     spinner.stop()
                 denied = True
+                if self.trace:
+                    self.trace.event("controller.denied", controller="claude",
+                                     role=self.speaker)
                 self.io_out.write("\n" + ui.label(self.speaker, tty) + denial_message())
             elif kind == "result":
                 if spinner:
@@ -432,9 +483,18 @@ class ClaudeSession:
                 elif denied:
                     self.io_out.write("\n")
                 if parsed.get("is_error"):
+                    if self.trace:
+                        self.trace.event(
+                            "controller.turn.end", controller="claude",
+                            role=self.speaker, result="error",
+                            subtype=parsed.get("subtype"))
                     self.io_out.write(
                         ui.colorize("[error] " + (parsed.get("text") or ""),
                                     ui.RED, tty) + "\n")
+                elif self.trace:
+                    self.trace.event("controller.turn.end", controller="claude",
+                                     role=self.speaker, result="ok",
+                                     subtype=parsed.get("subtype"))
                 self.io_out.flush()
                 return
             self.io_out.flush()
@@ -452,7 +512,7 @@ class CodexSession:
     `codex exec resume <thread_id>` per send(). A spinner runs during each turn."""
 
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
-                 resume_thread_id=None, on_thread_id=None):
+                 resume_thread_id=None, on_thread_id=None, trace=None):
         self.mode = mode
         self.yolo = yolo
         self.io_out = io_out or sys.stdout
@@ -460,6 +520,7 @@ class CodexSession:
         self.label = speaker_label(speaker)
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
+        self.trace = trace
         self._notified = False
         self._resuming_first = resume_thread_id is not None
         self._started = False
@@ -511,20 +572,52 @@ class CodexSession:
     def send(self, text):
         if not self._started and not self._resuming_first:
             command = build_codex_command(text, self.mode, self.yolo)
+            fresh = True
         else:
             if not self.thread_id:
                 self.io_out.write("[error] no codex thread id; cannot continue\n")
                 self.io_out.flush()
+                if self.trace:
+                    self.trace.event("controller.turn.end", controller="codex",
+                                     role=self.speaker, result="error",
+                                     error_type="missing_thread_id")
                 return
             command = build_codex_resume_command(self.thread_id, text)
+            fresh = False
         self._started = True
-        events = self._run(command)
+        if self.trace:
+            data = trace_store.command_meta(command, prompt_text=text)
+            self.trace.event(
+                "controller.turn.start", controller="codex", role=self.speaker,
+                fresh=fresh, resume=not fresh, mode=self.mode, yolo=self.yolo,
+                cwd=os.getcwd(), thread_id=self.thread_id, **data)
+        try:
+            events = self._run(command)
+        except Exception as exc:  # noqa: BLE001
+            if self.trace:
+                self.trace.event("controller.turn.end", controller="codex",
+                                 role=self.speaker, result="error",
+                                 error_type=type(exc).__name__)
+            raise
         tid = capture_thread_id(events)
         if tid and not self.thread_id:
             self.thread_id = tid
+            if self.trace:
+                self.trace.event("controller.thread_id", controller="codex",
+                                 role=self.speaker, thread_id=self.thread_id)
         if self.thread_id and self.on_thread_id and not self._notified:
             self._notified = True
+            if self.trace:
+                self.trace.event("controller.thread_id.notified",
+                                 controller="codex", role=self.speaker,
+                                 thread_id=self.thread_id)
             self.on_thread_id(self.thread_id)
+        kinds = [parse_codex_event(obj).get("kind") for obj in events]
+        result = "error" if "error" in kinds else "denied" if "denied" in kinds else "ok"
+        if self.trace:
+            self.trace.event("controller.turn.end", controller="codex",
+                             role=self.speaker, result=result,
+                             thread_id=self.thread_id, event_count=len(events))
 
     def close(self):
         pass
