@@ -22,6 +22,7 @@ import cowork  # noqa: E402
 import cowork_bridge as bridge  # noqa: E402
 import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
+import cowork_trace as trace_store  # noqa: E402
 import cowork_ui as ui  # noqa: E402
 
 # The rich UX stack is optional at import time (lazy-imported in cowork_ui). Tests
@@ -99,7 +100,7 @@ class PreflightTest(unittest.TestCase):
         cfg = {
             "scout": {"controller": "claude"},
             "planner": {"controller": "claude"},
-            "advisor": {"controller": "codex"},
+            "planning-advisor": {"controller": "codex"},
         }
         self.assertEqual(preflight.required_controllers(cfg), ["claude", "codex"])
 
@@ -175,7 +176,7 @@ class MenuTest(unittest.TestCase):
 
     def test_configure_roles_accepts_defaults(self):
         cfg = cowork.configure_roles_interactive(
-            ["scout", "advisor"],
+            ["scout", "planning-advisor"],
             select_fn=lambda opts, default=None, message="": "use these defaults",
             checkbox_fn=lambda *a, **k: [])
         self.assertEqual(cfg["scout"], cowork.DEFAULTS["scout"])
@@ -206,7 +207,7 @@ class MenuTest(unittest.TestCase):
             "the brief")
 
     def test_format_config_summary_aligned(self):
-        cfg = cowork.default_config(["scout", "advisor", "builder"])
+        cfg = cowork.default_config(["scout", "planning-advisor", "builder"])
         text = cowork.format_config_summary(cfg)
         self.assertIn("scout", text)
         for label in ("role", "controller", "permissions", "mode"):
@@ -242,14 +243,17 @@ class ArgsPathTest(unittest.TestCase):
         return cowork.build_parser().parse_args(argv)
 
     def test_parse_team(self):
-        selected, err = cowork.parse_team("advisor,scout")
+        selected, err = cowork.parse_team("planning-advisor,scout")
         self.assertIsNone(err)
-        self.assertEqual(selected, ["scout", "advisor"])  # canonical order
+        self.assertEqual(selected, ["scout", "planning-advisor"])  # canonical order
         selected, err = cowork.parse_team("scout,ghost")
+        self.assertIsNotNone(err)
+        # the reserved name was renamed: plain `advisor` is no longer a role
+        selected, err = cowork.parse_team("scout,advisor")
         self.assertIsNotNone(err)
 
     def test_apply_config_args(self):
-        cfg = cowork.default_config(["scout", "advisor"])
+        cfg = cowork.default_config(["scout", "planning-advisor"])
         ok, err = cowork.apply_config_args(cfg, ["scout=codex,no-yolo,implement"])
         self.assertTrue(ok)
         self.assertEqual(
@@ -297,7 +301,7 @@ class ArgsPathTest(unittest.TestCase):
             return 0
 
         args = self._args(
-            ["--team", "scout,advisor",
+            ["--team", "scout,planning-advisor",
              "--config", "scout=codex,no-yolo,implement",
              "--context", "do the thing", "--no-session"])
         out = io.StringIO()
@@ -307,19 +311,19 @@ class ArgsPathTest(unittest.TestCase):
             run_scout_fn=fake_run_scout,
         )
         self.assertEqual(rc, 0)
-        self.assertEqual(captured["selected"], ["scout", "advisor"])
+        self.assertEqual(captured["selected"], ["scout", "planning-advisor"])
         self.assertEqual(captured["context"], "do the thing")
         self.assertEqual(captured["config"]["scout"]["controller"], "codex")
 
     def test_run_flow_non_interactive_skips_gum_in_preflight(self):
         # claude present, gum absent: non-interactive must still pass preflight.
-        args = self._args(["--team", "advisor", "--context", "x", "--no-session"])
+        args = self._args(["--team", "revisor", "--context", "x", "--no-session"])
         out = io.StringIO()
         rc = cowork.run_flow(
             args, io_out=out,
             which=lambda c: None if c == "gum" else "/bin/" + c,
         )
-        # advisor (no scout) -> "not selected" note, rc 0, gum never required
+        # revisor (no scout) -> "not selected" note, rc 0, gum never required
         self.assertEqual(rc, 0)
         self.assertIn("scout not selected", out.getvalue())
 
@@ -334,11 +338,11 @@ class StateStoreTest(unittest.TestCase):
     def test_save_load_roundtrip_and_has_config(self):
         path = self._tmp()
         self.assertIsNone(state_store.load(path))
-        cfg = cowork.default_config(["scout", "advisor"])
-        state_store.save_config(path, ["scout", "advisor"], cfg)
+        cfg = cowork.default_config(["scout", "planning-advisor"])
+        state_store.save_config(path, ["scout", "planning-advisor"], cfg)
         loaded = state_store.load(path)
         self.assertTrue(state_store.has_config(loaded))
-        self.assertEqual(loaded["team"], ["scout", "advisor"])
+        self.assertEqual(loaded["team"], ["scout", "planning-advisor"])
         self.assertEqual(loaded["config"]["scout"]["controller"], "claude")
 
     def test_role_session_roundtrip_and_controller_match(self):
@@ -373,12 +377,92 @@ class StateStoreTest(unittest.TestCase):
             fh.write("not json")
         self.assertIsNone(state_store.read_status(path))
 
+    def test_invalidate_ready_status(self):
+        path = self._tmp()
+        self.assertFalse(state_store.invalidate_ready_status(path))  # missing
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"summary": "keep me"}}, fh)
+        self.assertTrue(state_store.invalidate_ready_status(path))
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["status"], "needs_input")
+        self.assertEqual(data["result"], {"summary": "keep me"})
+        self.assertFalse(state_store.invalidate_ready_status(path))
+
     def test_load_rejects_incompatible_version(self):
         path = self._tmp()
         os.makedirs(os.path.dirname(path))
         with open(path, "w") as fh:
             fh.write('{"version": 999, "team": ["scout"], "config": {}}')
         self.assertIsNone(state_store.load(path))
+
+
+class TraceTest(unittest.TestCase):
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "trace.X.jsonl")
+
+    def _events(self, path):
+        with open(path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_trace_append_is_jsonl_and_does_not_touch_stdout(self):
+        import contextlib
+        path = self._tmp()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            trace.event("status.read", role="scout", status="needs_input")
+        self.assertEqual(out.getvalue(), "")
+        events = self._events(path)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "status.read")
+        self.assertEqual(events[0]["session_uuid"], "X")
+        self.assertEqual(events[0]["run_id"], "R")
+        self.assertEqual(events[0]["status"], "needs_input")
+        self.assertIn("ts", events[0])
+
+    def test_command_meta_redacts_prompt_but_keeps_hash_and_length(self):
+        secret = "please do not duplicate this prompt"
+        meta = trace_store.command_meta(["codex", "exec", secret],
+                                        prompt_text=secret)
+        self.assertEqual(meta["argv"], ["codex", "exec", "<prompt>"])
+        self.assertEqual(meta["prompt_bytes"], len(secret.encode("utf-8")))
+        self.assertEqual(meta["prompt_sha256"],
+                         trace_store.prompt_meta(secret)["prompt_sha256"])
+        self.assertNotIn(secret, json.dumps(meta))
+
+    def test_codex_session_traces_redacted_controller_metadata(self):
+        import unittest.mock as mock
+
+        class Proc:
+            def __init__(self):
+                self.stdout = iter([
+                    json.dumps({"type": "thread.started", "thread_id": "T1"}),
+                    json.dumps({"type": "turn.completed"}),
+                ])
+
+            def wait(self):
+                return 0
+
+        path = self._tmp()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        with mock.patch.object(bridge.subprocess, "Popen", return_value=Proc()):
+            sess = bridge.CodexSession("implement", True, io_out=io.StringIO(),
+                                      trace=trace)
+            sess.send("secret prompt body")
+        events = self._events(path)
+        start = [e for e in events if e["event"] == "controller.turn.start"][0]
+        self.assertEqual(start["controller"], "codex")
+        self.assertEqual(start["argv"][-1], "<prompt>")
+        self.assertIn("prompt_sha256", start)
+        self.assertNotIn("secret prompt body", json.dumps(events))
+        self.assertTrue(any(e["event"] == "controller.thread_id"
+                            and e["thread_id"] == "T1" for e in events))
 
 
 class SessionFlowTest(unittest.TestCase):
@@ -390,6 +474,13 @@ class SessionFlowTest(unittest.TestCase):
 
     def _args(self, argv):
         return cowork.build_parser().parse_args(argv)
+
+    def _trace_events(self, session_path):
+        saved = state_store.load(session_path)
+        tpath = trace_store.trace_path_for(
+            os.path.dirname(session_path), state_store.get_session_uuid(saved))
+        with open(tpath, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
 
     def test_config_saved_then_reused_and_session_resumed(self):
         spath = self._tmp_session()
@@ -433,6 +524,34 @@ class SessionFlowTest(unittest.TestCase):
         # session uuid is stable across runs
         self.assertEqual(state_store.get_session_uuid(state_store.load(spath)), suid)
         self.assertIn(suid, fake_scout.last_intel)
+
+    def test_run_flow_traces_context_and_saved_session(self):
+        spath = self._tmp_session()
+
+        def fake_scout(config, context, selected, io_in=None, io_out=None,
+                      resume_id=None, on_session=None, **kwargs):
+            if on_session and resume_id is None:
+                on_session("claude", "scout-trace-id")
+            return 0
+
+        rc = cowork.run_flow(
+            self._args(["--team", "scout", "--context", "trace goal",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        events = self._trace_events(spath)
+        self.assertTrue(any(e["event"] == "run.start" for e in events))
+        self.assertTrue(any(e["event"] == "context.saved" for e in events))
+        self.assertTrue(any(e["event"] == "role.session_saved"
+                            and e["role"] == "scout"
+                            and e["session_id"] == "scout-trace-id"
+                            for e in events))
+        self.assertTrue(any(e["event"] == "context.ack"
+                            and e["role"] == "scout"
+                            and e["revision"] == 1 for e in events))
+        self.assertTrue(any(e["event"] == "run.end" and e["rc"] == 0
+                            for e in events))
 
     def test_no_session_writes_nothing(self):
         spath = self._tmp_session()
@@ -554,7 +673,7 @@ class FallthroughTest(unittest.TestCase):
 
     def test_brief_without_planner(self):
         brief = cowork.assemble_scout_brief(
-            ["scout", "advisor"], ".cowork/scout.intel.S.json")
+            ["scout", "planning-advisor"], ".cowork/scout.intel.S.json")
         self.assertIn("lightweight plan", brief)
 
     def test_brief_requires_json(self):
@@ -646,6 +765,16 @@ class ScoutLoopTest(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
         return os.path.join(d, ".cowork", "scout.intel.X.json")
 
+    def _trace(self, intel_path):
+        return trace_store.Trace(
+            os.path.join(os.path.dirname(intel_path), "trace.X.jsonl"),
+            session_uuid="X", run_id="R")
+
+    def _trace_events(self, intel_path):
+        path = os.path.join(os.path.dirname(intel_path), "trace.X.jsonl")
+        with open(path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
     def _session(self, intel_path, statuses):
         test = self
 
@@ -669,10 +798,11 @@ class ScoutLoopTest(unittest.TestCase):
     def test_needs_input_then_review_then_approve(self):
         intel = self._intel()
         sess = self._session(intel, ["needs_input", "ready_for_review"])
+        trace = self._trace(intel)
         out = io.StringIO()
         rc = cowork._scout_loop(
             sess, "seed", intel, context="ctx",
-            io_in=io.StringIO("answer 1\n\n"), io_out=out)
+            io_in=io.StringIO("answer 1\n\n"), io_out=out, trace=trace)
         self.assertEqual(rc, 0)
         self.assertEqual(sess.sent, ["seed", "answer 1"])
         self.assertTrue(sess.closed)
@@ -680,6 +810,17 @@ class ScoutLoopTest(unittest.TestCase):
         self.assertIn("scout needs your input", text)
         self.assertIn("ready for review", text)
         self.assertIn("scout finished", text)
+        events = self._trace_events(intel)
+        self.assertTrue(any(e["event"] == "status.read"
+                            and e["status"] == "needs_input" for e in events))
+        self.assertTrue(any(e["event"] == "gate.show"
+                            and e["gate"] == "needs_input" for e in events))
+        self.assertTrue(any(e["event"] == "user.action"
+                            and e["action"] == "answer" for e in events))
+        self.assertTrue(any(e["event"] == "gate.show"
+                            and e["gate"] == "ready_for_review" for e in events))
+        self.assertTrue(any(e["event"] == "user.action"
+                            and e["action"] == "approve" for e in events))
 
     def test_review_revise_then_approve(self):
         intel = self._intel()
@@ -1021,6 +1162,16 @@ class ScoutLoopReviewTest(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         return os.path.join(d, ".cowork", "scout.intel.X.json")
 
+    def _trace(self, intel_path):
+        return trace_store.Trace(
+            os.path.join(os.path.dirname(intel_path), "trace.X.jsonl"),
+            session_uuid="X", run_id="R")
+
+    def _trace_events(self, intel_path):
+        path = os.path.join(os.path.dirname(intel_path), "trace.X.jsonl")
+        with open(path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
     def _session(self, intel_path, statuses):
         class FakeSession:
             def __init__(self):
@@ -1066,9 +1217,11 @@ class ScoutLoopReviewTest(unittest.TestCase):
         self.assertIn("fix the cited path", sess.sent[1])
         # ...and the reviewer ran twice; the user only saw the 'reviewed' marker.
         self.assertEqual(rfn.calls["n"], 2)
-        self.assertIn("reviewed", out.getvalue())
+        text = out.getvalue()
+        self.assertIn("reviewed: changes requested", text)
+        self.assertIn("reviewed: approved", text)
         # single-voice: reviewer finding text never reached the user channel.
-        self.assertNotIn("fix the cited path", out.getvalue())
+        self.assertNotIn("fix the cited path", text)
 
     def test_round_cap_falls_through_to_user_with_dissent(self):
         intel = self._intel()
@@ -1160,6 +1313,51 @@ class ScoutLoopReviewTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sess.sent, ["seed"])
         self.assertNotIn("reviewed", out.getvalue())
+
+    def test_user_revision_invalidates_stale_ready_before_next_turn(self):
+        intel = self._intel()
+
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                if len(self.sent) == 1:
+                    os.makedirs(os.path.dirname(intel), exist_ok=True)
+                    with open(intel, "w") as fh:
+                        json.dump({"status": "ready_for_review",
+                                   "result": {"summary": "old ready"}}, fh)
+
+            def close(self):
+                self.closed = True
+
+        sess = FakeSession()
+        rfn = self._review_fn([{"verdict": "approve"}])
+        trace = self._trace(intel)
+        out = io.StringIO()
+        rc = cowork._scout_loop(sess, "seed", intel, context="",
+                                io_in=io.StringIO("new concern\n"),
+                                io_out=out, review_fn=rfn, trace=trace)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sess.sent, ["seed", "new concern"])
+        self.assertTrue(sess.closed)
+        self.assertEqual(rfn.calls["n"], 1)
+        text = out.getvalue()
+        self.assertIn("scout needs your input", text)
+        self.assertNotIn("scout finished", text)
+        with open(intel, "r") as fh:
+            self.assertEqual(json.load(fh)["status"], "needs_input")
+        events = self._trace_events(intel)
+        self.assertTrue(any(e["event"] == "review.verdict"
+                            and e["verdict"] == "approve" for e in events))
+        self.assertTrue(any(e["event"] == "user.action"
+                            and e["action"] == "revise" for e in events))
+        self.assertTrue(any(e["event"] == "status.invalidated"
+                            and e["changed"] for e in events))
+        self.assertTrue(any(e["event"] == "gate.show"
+                            and e["gate"] == "needs_input" for e in events))
 
 
 class MakeReviewFnTest(unittest.TestCase):
@@ -1948,6 +2146,548 @@ class LiveCodexTest(unittest.TestCase):
             bridge.parse_codex_event(o).get("text", "")
             for o in objs2 if bridge.parse_codex_event(o)["kind"] == "message")
         self.assertIn("7", texts)
+
+
+class PhaseStateTest(unittest.TestCase):
+    """Phase persistence + the hand-back payload reader in cowork_state."""
+
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def test_phase_defaults_to_scouting(self):
+        self.assertEqual(state_store.get_phase(None), "scouting")
+        self.assertEqual(state_store.get_phase({}), "scouting")
+        # unknown values are treated as scouting (back-compat / corruption)
+        self.assertEqual(state_store.get_phase({"phase": "done"}), "scouting")
+
+    def test_save_phase_roundtrip_preserves_state(self):
+        path = self._tmp()
+        state = state_store.save_config(
+            path, ["scout", "planner"],
+            cowork.default_config(["scout", "planner"]))
+        state = state_store.save_phase(path, "planning", prior=state)
+        loaded = state_store.load(path)
+        self.assertEqual(state_store.get_phase(loaded), "planning")
+        self.assertEqual(loaded["team"], ["scout", "planner"])  # preserved
+
+    def test_planner_path_helpers(self):
+        self.assertEqual(
+            state_store.planner_plan_json_path_for(".cowork", "abc"),
+            ".cowork/planner.plan.abc.json")
+        self.assertEqual(
+            state_store.planner_plan_md_path_for(".cowork", "abc"),
+            ".cowork/planner.plan.abc.md")
+        self.assertEqual(
+            state_store.planner_review_path_for(".cowork", "abc"),
+            ".cowork/planner-review.abc.json")
+
+    def test_read_handoff(self):
+        path = self._tmp()  # reuse tmp dir; file path below
+        plan = os.path.join(os.path.dirname(path), "planner.plan.X.json")
+        self.assertIsNone(state_store.read_handoff(plan))     # missing
+        os.makedirs(os.path.dirname(plan), exist_ok=True)
+        with open(plan, "w") as fh:
+            fh.write("not json")
+        self.assertIsNone(state_store.read_handoff(plan))     # malformed
+        with open(plan, "w") as fh:
+            json.dump({"status": "needs_input", "handoff": "x"}, fh)
+        self.assertIsNone(state_store.read_handoff(plan))     # wrong status
+        with open(plan, "w") as fh:
+            json.dump({"status": "handoff_back", "handoff": "  "}, fh)
+        self.assertIsNone(state_store.read_handoff(plan))     # empty payload
+        with open(plan, "w") as fh:
+            json.dump({"status": "handoff_back",
+                       "handoff": "re-check scope"}, fh)
+        self.assertEqual(state_store.read_handoff(plan), "re-check scope")
+
+    def test_invalidate_handoff_back(self):
+        path = self._tmp()
+        plan = os.path.join(os.path.dirname(path), "planner.plan.X.json")
+        os.makedirs(os.path.dirname(plan), exist_ok=True)
+        with open(plan, "w") as fh:
+            json.dump({"status": "handoff_back", "handoff": "n"}, fh)
+        # default from_status leaves a handoff_back untouched
+        self.assertFalse(state_store.invalidate_ready_status(plan))
+        self.assertTrue(state_store.invalidate_ready_status(
+            plan, from_status="handoff_back"))
+        with open(plan, "r") as fh:
+            self.assertEqual(json.load(fh)["status"], "needs_input")
+
+
+class PlanningAdvisorRegistrationTest(unittest.TestCase):
+    def test_role_renamed_and_registered(self):
+        self.assertIn("planning-advisor", cowork.ROLES)
+        self.assertNotIn("advisor", cowork.ROLES)   # reserved name renamed
+        # paired with the planner: placed right after it
+        self.assertEqual(cowork.ROLES.index("planning-advisor"),
+                         cowork.ROLES.index("planner") + 1)
+        # inherits the old advisor defaults
+        self.assertEqual(
+            cowork.DEFAULTS["planning-advisor"],
+            {"controller": "codex", "yolo": True, "mode": "implement"})
+
+    def test_role_prompt_files_exist(self):
+        self.assertTrue(os.path.exists(cowork.PLANNER_PROMPT_PATH))
+        self.assertTrue(os.path.exists(cowork.PLANNING_ADVISOR_PROMPT_PATH))
+
+    def test_handback_contract_planner_to_scout_only(self):
+        self.assertEqual(cowork.HANDBACK_PREPROCESSOR, {"planner": "scout"})
+
+
+class PlannerLoopTest(unittest.TestCase):
+    """Drive run_planner/_role_loop with a fake session writing plan statuses."""
+
+    def _paths(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return (os.path.join(d, ".cowork", "planner.plan.X.json"),
+                os.path.join(d, ".cowork", "planner.plan.X.md"))
+
+    def _session(self, plan_json, statuses):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                entry = statuses.pop(0) if statuses else {"status": "ready_for_review"}
+                os.makedirs(os.path.dirname(plan_json), exist_ok=True)
+                with open(plan_json, "w") as fh:
+                    json.dump(dict({"session": "X", "role": "planner",
+                                    "result": {}}, **entry), fh)
+
+            def close(self):
+                self.closed = True
+        return FakeSession()
+
+    def _run(self, plan_json, plan_md, sess, io_in, reviewer_runner=None,
+             handoff_confirm=None, selected=None):
+        out = io.StringIO()
+        outcomes = []
+        config = cowork.default_config(
+            selected or ["scout", "planner", "planning-advisor"])
+        config["planner"]["controller"] = "codex"
+        rc = cowork.run_planner(
+            config, "seed", selected or ["scout", "planner", "planning-advisor"],
+            io_in=io_in, io_out=out,
+            plan_json_path=plan_json, plan_md_path=plan_md,
+            review_path=os.path.join(os.path.dirname(plan_json),
+                                     "planner-review.X.json"),
+            session_factory=lambda *a, **k: sess,
+            reviewer_runner=reviewer_runner,
+            handoff_confirm=handoff_confirm,
+            on_outcome=lambda o, p: outcomes.append((o, p)))
+        return rc, out.getvalue(), outcomes
+
+    def test_needs_input_then_ready_then_approve(self):
+        plan_json, plan_md = self._paths()
+        sess = self._session(plan_json, [{"status": "needs_input"},
+                                         {"status": "ready_for_review"}])
+        rfn_calls = []
+
+        def runner(config, context, selected, p, review_path, **kw):
+            rfn_calls.append(p)
+            return {"verdict": "approve"}
+
+        rc, text, outcomes = self._run(
+            plan_json, plan_md, sess, io.StringIO("answer\n\n"),
+            reviewer_runner=runner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sess.sent[1], "answer")
+        self.assertIn("planner needs your input", text)
+        self.assertIn("plan ready for review", text)
+        self.assertIn("planner finished", text)
+        self.assertEqual(rfn_calls, [plan_json])     # advisor saw the plan JSON
+        self.assertEqual(outcomes, [("approved", None)])
+
+    def test_advisor_revise_loops_then_user_gate(self):
+        plan_json, plan_md = self._paths()
+        sess = self._session(plan_json, [{"status": "ready_for_review"},
+                                         {"status": "ready_for_review"}])
+        verdicts = [{"verdict": "revise", "findings": ["cover migration risk"]},
+                    {"verdict": "approve"}]
+
+        def runner(config, context, selected, p, review_path, **kw):
+            return verdicts.pop(0)
+
+        rc, text, outcomes = self._run(
+            plan_json, plan_md, sess, io.StringIO(""), reviewer_runner=runner)
+        self.assertEqual(rc, 0)
+        self.assertIn("[reviewer handoff]", sess.sent[1])
+        self.assertIn("cover migration risk", sess.sent[1])
+        # the planner is told about its PLAN, not the scout's intel
+        self.assertIn("update your plan", sess.sent[1])
+        self.assertNotIn("intel", sess.sent[1])
+        # single-voice: advisor findings never reach the user channel
+        self.assertNotIn("cover migration risk", text)
+        self.assertIn("reviewed: changes requested", text)
+        self.assertEqual(outcomes, [("approved", None)])
+
+    def test_handoff_confirmed_returns_payload(self):
+        plan_json, plan_md = self._paths()
+        sess = self._session(
+            plan_json, [{"status": "handoff_back", "handoff": "re-scout auth"}])
+        rc, text, outcomes = self._run(
+            plan_json, plan_md, sess, io.StringIO(""),
+            handoff_confirm=lambda io_in, io_out: True)
+        self.assertEqual(rc, 0)
+        self.assertIn("hand the work back to the scout", text)
+        self.assertIn("re-scout auth", text)        # payload shown at the gate
+        self.assertEqual(outcomes, [("handoff", "re-scout auth")])
+        self.assertTrue(sess.closed)
+
+    def test_handoff_declined_continues_planning(self):
+        plan_json, plan_md = self._paths()
+        sess = self._session(
+            plan_json, [{"status": "handoff_back", "handoff": "re-scout auth"},
+                        {"status": "ready_for_review"}])
+
+        def runner(config, context, selected, p, review_path, **kw):
+            return {"verdict": "approve"}
+
+        rc, text, outcomes = self._run(
+            plan_json, plan_md, sess, io.StringIO(""),
+            reviewer_runner=runner,
+            handoff_confirm=lambda io_in, io_out: False)
+        self.assertEqual(rc, 0)
+        # the declined note was injected as the planner's next turn...
+        self.assertIn("DECLINED", sess.sent[1])
+        # ...the stale handoff_back was downgraded before that turn ran
+        self.assertEqual(outcomes, [("approved", None)])
+
+    def test_handoff_without_payload_degrades_to_needs_input(self):
+        plan_json, plan_md = self._paths()
+        sess = self._session(plan_json, [{"status": "handoff_back"}])
+        gates = []
+        rc, text, outcomes = self._run(
+            plan_json, plan_md, sess, io.StringIO(""),  # EOF ends after gate
+            handoff_confirm=lambda io_in, io_out: gates.append(True) or True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(gates, [])                     # gate never shown
+        self.assertIn("planner needs your input", text)
+        self.assertEqual(outcomes, [("ended", None)])
+
+    def test_no_advisor_on_team_skips_review(self):
+        plan_json, plan_md = self._paths()
+        sess = self._session(plan_json, [{"status": "ready_for_review"}])
+        rc, text, outcomes = self._run(
+            plan_json, plan_md, sess, io.StringIO(""),
+            selected=["scout", "planner"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("reviewed", text)
+        self.assertEqual(outcomes, [("approved", None)])
+
+
+class PlannerSeedTest(unittest.TestCase):
+    def _intel(self, content):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        path = os.path.join(d, "scout.intel.X.json")
+        with open(path, "w") as fh:
+            fh.write(content)
+        return path
+
+    def test_planner_seed_carries_intel_and_context(self):
+        intel = self._intel('{"status": "ready_for_review", "result": {"k": 1}}')
+        seed = cowork.assemble_planner_seed(intel, "the goal")
+        self.assertIn("APPROVED", seed)
+        self.assertIn('"k": 1', seed)
+        self.assertIn("the goal", seed)
+
+    def test_intel_updated_block_carries_intel(self):
+        intel = self._intel('{"result": {"new": true}}')
+        block = cowork.intel_updated_block(intel)
+        self.assertIn("intel changed", block)
+        self.assertIn('"new": true', block)
+
+    def test_handoff_wake_block_carries_payload(self):
+        block = cowork.handoff_wake_block("narrow the scope to X")
+        self.assertIn("<handoff>\nnarrow the scope to X\n</handoff>", block)
+        self.assertIn("ready_for_review", block)
+
+    def test_planner_brief_names_both_artifacts(self):
+        brief = cowork.assemble_planner_brief("a.json", "a.md")
+        self.assertIn("a.json", brief)
+        self.assertIn("a.md", brief)
+        self.assertIn("ONLY write targets", brief)
+
+    def test_advisor_context_carries_both_artifacts(self):
+        intel = self._intel('{"plan": "J"}')
+        md = intel + ".md"
+        with open(md, "w") as fh:
+            fh.write("# MD PLAN")
+        ctx = cowork.assemble_advisor_context("goal", ["planner"], intel, md)
+        self.assertIn('"plan": "J"', ctx)
+        self.assertIn("# MD PLAN", ctx)
+        self.assertIn("goal", ctx)
+        resumed = cowork.assemble_advisor_resume_context(
+            intel, md, context_update="new goal")
+        self.assertIn("<context>\nnew goal\n</context>", resumed)
+        self.assertIn("# MD PLAN", resumed)
+
+
+class PhaseChainFlowTest(unittest.TestCase):
+    """run_flow phase loop: chaining, hand-back round trip, resume, refusal."""
+
+    def _tmp_session(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _fakes(self, scout_outcomes, planner_outcomes):
+        """Build fake run_scout/run_planner that replay scripted outcomes."""
+        calls = {"scout": [], "planner": []}
+
+        def fake_scout(config, context, selected, on_outcome=None,
+                       on_session=None, resume_id=None, **kw):
+            calls["scout"].append({"context": context, "resume_id": resume_id,
+                                   "intel_path": kw.get("intel_path")})
+            if on_session and resume_id is None:
+                on_session("claude", "scout-%d" % len(calls["scout"]))
+            if on_outcome:
+                on_outcome(scout_outcomes.pop(0))
+            return 0
+
+        def fake_planner(config, context, selected, on_outcome=None,
+                         on_session=None, resume_id=None, **kw):
+            calls["planner"].append({
+                "context": context, "resume_id": resume_id,
+                "plan_json_path": kw.get("plan_json_path"),
+                "plan_md_path": kw.get("plan_md_path"),
+                "review_path": kw.get("review_path")})
+            if on_session and resume_id is None:
+                on_session("claude", "planner-%d" % len(calls["planner"]))
+            if on_outcome:
+                on_outcome(*planner_outcomes.pop(0))
+            return 0
+
+        return calls, fake_scout, fake_planner
+
+    def _write_intel(self, spath):
+        saved = state_store.load(spath)
+        suid = state_store.get_session_uuid(saved)
+        intel = os.path.join(os.path.dirname(spath),
+                             "scout.intel.%s.json" % suid)
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"finding": "F1"}}, fh)
+        return intel
+
+    def test_scout_approval_chains_into_planning_same_run(self):
+        spath = self._tmp_session()
+        calls, fake_scout, fake_planner = self._fakes(
+            ["approved"], [("approved", None)])
+
+        # Pre-create the session so the intel file exists when the seed is built.
+        state_store.ensure_session(spath, None, "S")
+        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"finding": "F1"}}, fh)
+
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,scout-reviewer,planner,planning-advisor",
+                        "--context", "build the thing", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls["scout"]), 1)
+        self.assertEqual(len(calls["planner"]), 1)
+        # fresh planner is seeded with the approved intel + shared context
+        seed = calls["planner"][0]["context"]
+        self.assertIn("APPROVED", seed)
+        self.assertIn('"finding": "F1"', seed)
+        self.assertIn("build the thing", seed)
+        # planner artifacts named by the session uuid
+        self.assertIn("planner.plan.S.json", calls["planner"][0]["plan_json_path"])
+        self.assertIn("planner.plan.S.md", calls["planner"][0]["plan_md_path"])
+        self.assertIn("planner-review.S.json", calls["planner"][0]["review_path"])
+        # plan approval is terminal: the run ended with phase still `planning`
+        saved = state_store.load(spath)
+        self.assertEqual(state_store.get_phase(saved), "planning")
+        # both role sessions persisted
+        self.assertEqual(
+            state_store.get_role_session(saved, "planner", "claude"),
+            "planner-1")
+
+    def test_scout_eof_does_not_chain(self):
+        spath = self._tmp_session()
+        calls, fake_scout, fake_planner = self._fakes(
+            ["ended"], [("approved", None)])
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,planner",
+                        "--context", "x", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls["planner"]), 0)
+        self.assertEqual(state_store.get_phase(state_store.load(spath)),
+                         "scouting")
+
+    def test_handoff_round_trip_resumes_scout_then_planner(self):
+        spath = self._tmp_session()
+        calls, fake_scout, fake_planner = self._fakes(
+            ["approved", "approved"],
+            [("handoff", "narrow scope to auth"), ("approved", None)])
+        state_store.ensure_session(spath, None, "S")
+        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review", "result": {}}, fh)
+
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,planner",
+                        "--context", "x", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        # scout ran twice: fresh, then resumed with the handoff wake block
+        self.assertEqual(len(calls["scout"]), 2)
+        self.assertEqual(calls["scout"][1]["resume_id"], "scout-1")
+        self.assertIn("<handoff>\nnarrow scope to auth\n</handoff>",
+                      calls["scout"][1]["context"])
+        # planner ran twice: fresh seed, then resumed with the digest block
+        self.assertEqual(len(calls["planner"]), 2)
+        self.assertEqual(calls["planner"][1]["resume_id"], "planner-1")
+        self.assertIn("intel changed", calls["planner"][1]["context"])
+        self.assertEqual(state_store.get_phase(state_store.load(spath)),
+                         "planning")
+
+    def test_resume_into_planning_skips_scout(self):
+        spath = self._tmp_session()
+        state = state_store.save_config(
+            spath, ["scout", "planner"],
+            cowork.default_config(["scout", "planner"]))
+        state = state_store.save_phase(spath, "planning", prior=state)
+        state = state_store.save_role_session(
+            spath, "planner", "claude", "planner-9", prior=state)
+        calls, fake_scout, fake_planner = self._fakes([], [("approved", None)])
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,planner", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls["scout"]), 0)     # no scout run, no prompt
+        self.assertEqual(len(calls["planner"]), 1)
+        self.assertEqual(calls["planner"][0]["resume_id"], "planner-9")
+        self.assertEqual(calls["planner"][0]["context"], "")  # auto-continue
+
+    def test_fresh_planner_without_scout_is_refused(self):
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--team", "planner,planning-advisor",
+                        "--context", "x", "--no-session"]),
+            io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: 0,
+            run_planner_fn=lambda *a, **k: 0)
+        self.assertEqual(rc, 0)
+        self.assertIn("scout not selected", out.getvalue())
+        self.assertIn("Planning requires approved scout intel", out.getvalue())
+
+    def test_team_without_planner_keeps_terminal_scout(self):
+        spath = self._tmp_session()
+        calls, fake_scout, fake_planner = self._fakes(
+            ["approved"], [("approved", None)])
+        rc = cowork.run_flow(
+            self._args(["--team", "scout", "--context", "x",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls["planner"]), 0)
+
+    def test_handback_delivers_unseen_context_revision_to_scout(self):
+        # A run resumes into planning with a NEW --context (revision bumps; the
+        # scout has only acked the old one). When the planner hands back, the
+        # resumed scout must be woken with the context block AND the handoff —
+        # never have the revision marked seen without delivery.
+        spath = self._tmp_session()
+        state = state_store.save_config(
+            spath, ["scout", "planner"],
+            cowork.default_config(["scout", "planner"]))
+        state = state_store.save_context(spath, "old goal", prior=state)
+        state = state_store.save_phase(spath, "planning", prior=state)
+        state = state_store.save_role_session(
+            spath, "scout", "claude", "scout-1", prior=state)
+        state = state_store.save_role_session(
+            spath, "planner", "claude", "planner-1", prior=state)
+        state = state_store.mark_context_seen(spath, "scout", 1, prior=state)
+        state = state_store.mark_context_seen(spath, "planner", 1, prior=state)
+        calls, fake_scout, fake_planner = self._fakes(
+            ["ended"], [("handoff", "re-scope auth")])
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,planner",
+                        "--context", "new direction", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        # planner (resumed, unacked rev 2) got the new context as a wake block
+        self.assertIn("<context>\nnew direction\n</context>",
+                      calls["planner"][0]["context"])
+        # scout got BOTH the unseen revision and the handoff payload
+        scout_ctx = calls["scout"][0]["context"]
+        self.assertIn("New user context was provided", scout_ctx)
+        self.assertIn("<context>\nnew direction\n</context>", scout_ctx)
+        self.assertIn("<handoff>\nre-scope auth\n</handoff>", scout_ctx)
+        # and the delivery is what justifies the ack
+        self.assertEqual(state_store.get_seen_revision(
+            state_store.load(spath), "scout"), 2)
+
+    def test_resume_into_planning_without_planner_id_seeds_from_intel(self):
+        # Killed between save_phase("planning") and the planner id save: the
+        # next run must start a FRESH planner from the approved intel, not from
+        # a bare context.
+        spath = self._tmp_session()
+        state = state_store.ensure_session(spath, None, "S")
+        state = state_store.save_config(
+            spath, ["scout", "planner"],
+            cowork.default_config(["scout", "planner"]), prior=state)
+        state = state_store.save_phase(spath, "planning", prior=state)
+        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"finding": "F1"}}, fh)
+        calls, fake_scout, fake_planner = self._fakes([], [("approved", None)])
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,planner", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls["scout"]), 0)
+        self.assertIsNone(calls["planner"][0]["resume_id"])  # fresh session
+        seed = calls["planner"][0]["context"]
+        self.assertIn("APPROVED", seed)
+        self.assertIn('"finding": "F1"', seed)
+
+    def test_phase_change_traced(self):
+        spath = self._tmp_session()
+        calls, fake_scout, fake_planner = self._fakes(
+            ["approved"], [("approved", None)])
+        rc = cowork.run_flow(
+            self._args(["--team", "scout,planner", "--context", "x",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout, run_planner_fn=fake_planner)
+        self.assertEqual(rc, 0)
+        saved = state_store.load(spath)
+        tpath = trace_store.trace_path_for(
+            os.path.dirname(spath), state_store.get_session_uuid(saved))
+        with open(tpath, "r") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        self.assertTrue(any(e["event"] == "phase.change"
+                            and e["from"] == "scouting"
+                            and e["to"] == "planning" for e in events))
 
 
 if __name__ == "__main__":

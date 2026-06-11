@@ -23,8 +23,12 @@ import threading
 RESET = "\033[0m"
 CYAN = "\033[36m"     # the user
 GREEN = "\033[32m"    # the speaking role (scout, …)
+MAGENTA = "\033[35m"  # the planner (distinct from the scout's green)
 RED = "\033[31m"      # errors
 DIM = "\033[2m"       # turn separators / hints
+
+# Per-role label colors; any role not listed falls back to green.
+ROLE_COLORS = {"you": CYAN, "planner": MAGENTA}
 
 # Labels. The plain forms MUST stay byte-identical to the historical constants;
 # cowork_bridge re-exports these so `bridge.USER_LABEL` / `bridge.speaker_label`
@@ -51,9 +55,10 @@ def colorize(text, code, enabled):
 
 def label(name, enabled):
     """Speaker label, colored on a TTY and plain ('name › ') otherwise. The user
-    is cyan; any role is green. Plain output is byte-identical to the old labels."""
+    is cyan, the planner magenta; any other role is green. Plain output is
+    byte-identical to the old labels."""
     plain = USER_LABEL if name == "you" else speaker_label(name)
-    return colorize(plain, CYAN if name == "you" else GREEN, enabled)
+    return colorize(plain, ROLE_COLORS.get(name, GREEN), enabled)
 
 
 def shorten_path(path, cwd=None):

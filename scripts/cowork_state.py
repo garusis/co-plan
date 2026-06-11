@@ -97,6 +97,37 @@ def read_status(intel_path):
     return None
 
 
+def invalidate_ready_status(intel_path, from_status="ready_for_review"):
+    """Downgrade a stale `from_status` status (default `ready_for_review`) to
+    `needs_input`.
+
+    Returns True only when the file was changed. Tolerant by design: missing,
+    unreadable, malformed, or non-matching files are left alone and return
+    False."""
+    if not intel_path:
+        return False
+    try:
+        with open(intel_path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("status") != from_status:
+        return False
+    data["status"] = "needs_input"
+    try:
+        dirname = os.path.dirname(intel_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        tmp = intel_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, intel_path)
+    except OSError:
+        return False
+    return True
+
+
 VALID_VERDICTS = ("approve", "revise", "needs_user")
 
 
@@ -141,10 +172,47 @@ def _safe_revise(reason, user_question):
     }
 
 
+def read_handoff(path):
+    """Return the hand-back payload string when the status file signals
+    `handoff_back` with a non-empty `handoff` payload, else None. Tolerant by
+    design (mirrors read_status): a missing, unreadable, or malformed file —
+    or a `handoff_back` without a payload — yields None so the caller degrades
+    to the normal needs-input gate instead of triggering a hand-back."""
+    if not path:
+        return None
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("status") != "handoff_back":
+        return None
+    payload = str(data.get("handoff") or "").strip()
+    return payload or None
+
+
 def review_path_for(intel_dir, session_uuid):
     """Path of the scout-reviewer's verdict file for a session (sibling of the
     scout intel file)."""
     return os.path.join(intel_dir, "scout-review.%s.json" % session_uuid)
+
+
+def planner_plan_json_path_for(intel_dir, session_uuid):
+    """Path of the planner's JSON plan deliverable (machine source of truth and
+    the planner's status channel)."""
+    return os.path.join(intel_dir, "planner.plan.%s.json" % session_uuid)
+
+
+def planner_plan_md_path_for(intel_dir, session_uuid):
+    """Path of the planner's human-first markdown plan (the user's review
+    surface at the plan gate)."""
+    return os.path.join(intel_dir, "planner.plan.%s.md" % session_uuid)
+
+
+def planner_review_path_for(intel_dir, session_uuid):
+    """Path of the planning-advisor's verdict file for a session (sibling of
+    the planner plan files)."""
+    return os.path.join(intel_dir, "planner-review.%s.json" % session_uuid)
 
 
 def ensure_session(path, prior, new_uuid):
@@ -199,6 +267,37 @@ def save_role_session(path, role, controller, session_id, prior=None):
     entry.update({"controller": controller, "id": session_id})
     sessions[role] = entry
     state["sessions"] = sessions
+    save(path, state)
+    return state
+
+
+# --------------------------------------------------------------------------- #
+# Phase tracking.                                                               #
+#                                                                              #
+# The cowork flow is a loop of phases (scouting -> planning, with a            #
+# user-confirmed hand-back planning -> scouting). The current phase is         #
+# persisted so a killed run resumes into the last active phase. Plan approval  #
+# ends the CLI with the phase left at `planning`; a rerun resumes the planner  #
+# conversation the same way a rerun resumes the scout today.                   #
+# --------------------------------------------------------------------------- #
+
+PHASES = ("scouting", "planning")
+
+
+def get_phase(state):
+    """Return the persisted phase. Absent or unknown values default to
+    `scouting` for back-compat with session files written before phases."""
+    phase = (state or {}).get("phase")
+    return phase if phase in PHASES else "scouting"
+
+
+def save_phase(path, phase, prior=None):
+    """Persist the current phase, preserving the rest of the session state."""
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    state.setdefault("config", state.get("config") or {})
+    state.setdefault("sessions", state.get("sessions") or {})
+    state["phase"] = phase
     save(path, state)
     return state
 

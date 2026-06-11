@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""cowork: multi-role CLI orchestration entry flow + the scout (context
-gatherer) role.
+"""cowork: multi-role CLI orchestration entry flow + the scouting and planning
+phases.
 
-This is the foundation only: the 3-step entry flow (team checklist, per-role
-tool config, initial context), the preflight dependency check, and running the
-first role (`scout`) by spawning the selected CLI and bridging it to the user.
-Later roles (revisor/planner/advisor/builder) are out of scope here.
+The 3-step entry flow (team checklist, per-role tool config, initial context),
+the preflight dependency check, and a phase loop that drives the user-facing
+roles by spawning the selected CLI and bridging it to the user: the `scout`
+(paired with the `scout-reviewer`) gathers context; on intel approval the
+`planner` (paired with the `planning-advisor`) turns it into a plan, with a
+user-confirmed hand-back from planner to scout. Remaining roles
+(revisor/builder) are out of scope here.
 
-Selection uses `gum` for real interactive checkbox/choice menus. A
-non-interactive args path (--team/--config/--context) skips gum entirely so the
-flow is testable and scriptable.
+Selection uses questionary for real interactive checkbox/choice menus. A
+non-interactive args path (--team/--config/--context) skips the menus entirely
+so the flow is testable and scriptable.
 
 Additive to the co-plan skill: new file, stdlib only, Python 3.9+, does not
 import or modify co_plan_file.py.
@@ -25,27 +28,41 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cowork_bridge as bridge  # noqa: E402
 import cowork_preflight as preflight  # noqa: E402
 import cowork_state as state_store  # noqa: E402
+import cowork_trace as trace_store  # noqa: E402
 import cowork_ui as ui  # noqa: E402
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOUT_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout.md")
 SCOUT_REVIEWER_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "scout-reviewer.md")
+PLANNER_PROMPT_PATH = os.path.join(SKILL_ROOT, "roles", "planner.md")
+PLANNING_ADVISOR_PROMPT_PATH = os.path.join(
+    SKILL_ROOT, "roles", "planning-advisor.md")
 
-# Max reviewer<->scout review rounds per `ready_for_review` (D5). After this many
+# Max reviewer<->role review rounds per `ready_for_review` (D5). After this many
 # reviewer passes without approval, cowork falls through to the user review gate
-# with the reviewer's last dissent attached. Never hard-blocks.
+# with the reviewer's last dissent attached. Never hard-blocks. Shared by the
+# scout-reviewer and the planning-advisor.
 REVIEW_ROUND_CAP = 2
 
 # Role order matches the user's vision: context-gather, scout-reviewer,
-# plan-revisor, planner, advisor, implementer. `scout` (and its paired
-# `scout-reviewer`) are implemented now.
+# plan-revisor, planner, planning-advisor, implementer. `scout`/`scout-reviewer`
+# (the scouting phase) and `planner`/`planning-advisor` (the planning phase) are
+# implemented now.
 #
-# `scout-reviewer` is a critical reviewer paired with the scout DURING the scout
-# session (deterministically invoked when the scout sets `ready_for_review`); it
-# is distinct from `revisor`, the planned SEQUENTIAL plan-revisor that would run
-# after the scout.
+# `scout-reviewer` and `planning-advisor` are critical reviewers paired with
+# their user-facing role DURING that role's session (deterministically invoked
+# when the role sets `ready_for_review`); they are distinct from `revisor`, the
+# planned SEQUENTIAL plan-revisor that would run after the scout.
 SCOUT_REVIEWER = "scout-reviewer"
-ROLES = ["scout", SCOUT_REVIEWER, "revisor", "planner", "advisor", "builder"]
+PLANNING_ADVISOR = "planning-advisor"
+ROLES = ["scout", SCOUT_REVIEWER, "revisor", "planner", PLANNING_ADVISOR,
+         "builder"]
+
+# Hand-back contract: a user-facing role may set `status: "handoff_back"` (plus
+# a `handoff` payload) in its status file to hand the work back to its
+# pre-processor through a user-confirmed gate. The contract is role-generic;
+# only planner -> scout is wired this iteration.
+HANDBACK_PREPROCESSOR = {"planner": "scout"}
 
 # Per-role defaults (controller, yolo, mode), all roles checked by default.
 # Roles default to implement mode (write-enabled) and are kept in their lane by
@@ -55,7 +72,7 @@ DEFAULTS = {
     SCOUT_REVIEWER: {"controller": "codex", "yolo": True, "mode": "implement"},
     "revisor": {"controller": "codex", "yolo": True, "mode": "implement"},
     "planner": {"controller": "claude", "yolo": True, "mode": "implement"},
-    "advisor": {"controller": "codex", "yolo": True, "mode": "implement"},
+    PLANNING_ADVISOR: {"controller": "codex", "yolo": True, "mode": "implement"},
     "builder": {"controller": "claude", "yolo": True, "mode": "implement"},
 }
 
@@ -229,7 +246,7 @@ def build_parser():
     p.add_argument("--check", action="store_true",
                    help="run the preflight dependency check only")
     p.add_argument("--team",
-                   help="comma-separated roles, e.g. scout,advisor "
+                   help="comma-separated roles, e.g. scout,planner "
                         "(non-interactive)")
     p.add_argument("--config", action="append", default=[],
                    metavar="ROLE=opt,opt",
@@ -333,16 +350,17 @@ def read_scout_reviewer_prompt(path=SCOUT_REVIEWER_PROMPT_PATH):
         return fh.read()
 
 
-def assemble_reviewer_brief(review_path):
+def assemble_reviewer_brief(review_path, protected="the scout intel file"):
     """The reviewer's write-target instruction — its analogue of the scout brief.
-    It points at the review file only (never the scout intel)."""
+    It points at the review file only (never the reviewed artifact, named by
+    `protected`)."""
     return (
         "Write your verdict as a single JSON object to exactly this file:\n"
         "  %s\n"
-        "That review file is your ONLY write target. Do NOT edit the scout intel "
-        "file or any other file (reading/searching the repo is fine). Use the "
+        "That review file is your ONLY write target. Do NOT edit %s "
+        "or any other file (reading/searching the repo is fine). Use the "
         "verdict schema from your role (verdict: approve|revise|needs_user, "
-        "findings, and user_question when needs_user)." % review_path
+        "findings, and user_question when needs_user)." % (review_path, protected)
     )
 
 
@@ -363,14 +381,15 @@ def assemble_reviewer_context(context, selected, intel_path):
     )
 
 
-def assemble_reviewer_handoff(verdict, review):
-    """Build the scout-facing handoff string from a reviewer verdict dict.
+def assemble_reviewer_handoff(verdict, review, artifact="intel"):
+    """Build the role-facing handoff string from a reviewer verdict dict.
 
-    Pure string templating — NO second model call. This is the scout half of the
-    faithful-relay guardrail: for `needs_user` it carries the reviewer's FULL
-    `user_question` plus an instruction to relay it without changing its meaning
-    or dropping context. Returns "" for `approve` (no handoff; fall through to the
-    user gate)."""
+    Pure string templating — NO second model call. This is the reviewed role's
+    half of the faithful-relay guardrail: for `needs_user` it carries the
+    reviewer's FULL `user_question` plus an instruction to relay it without
+    changing its meaning or dropping context. `artifact` names what was
+    reviewed ("intel" for the scout, "plan" for the planner). Returns "" for
+    `approve` (no handoff; fall through to the user gate)."""
     review = review or {}
     findings = review.get("findings") or []
     if verdict == "needs_user":
@@ -387,18 +406,26 @@ def assemble_reviewer_handoff(verdict, review):
         bullet = "\n".join("- " + str(f) for f in findings) if findings else \
             "- (no specific findings provided)"
         return (
-            "[reviewer handoff] A reviewer checked your intel and it is not ready "
-            "to hand off yet. Address the following, update your intel, and set "
+            "[reviewer handoff] A reviewer checked your %s and it is not ready "
+            "to hand off yet. Address the following, update your %s, and set "
             "status back to ready_for_review when done. Do not mention the "
-            "reviewer to the user.\n%s" % bullet
+            "reviewer to the user.\n%s" % (artifact, artifact, bullet)
         )
     return ""
 
 
-def scout_reviewed_text():
-    """Content-free marker shown to the user so they can see a review happened
-    (D7). Carries no reviewer content; the substring 'reviewed' is asserted by
-    tests."""
+def scout_reviewed_text(verdict=None):
+    """Marker shown to the user so they can see a review happened (D7).
+
+    It exposes only the verdict class, never reviewer findings or questions. The
+    substring 'reviewed' is asserted by tests."""
+    v = verdict.get("verdict") if isinstance(verdict, dict) else verdict
+    if v == "approve":
+        return "reviewed: approved"
+    if v == "revise":
+        return "reviewed: changes requested"
+    if v == "needs_user":
+        return "reviewed: needs user input"
     return "reviewed"
 
 
@@ -445,18 +472,148 @@ def assemble_reviewer_resume_context(intel_path, context_update=None):
     return body
 
 
+# --------------------------------------------------------------------------- #
+# planner: the single user-facing voice of the planning phase, paired with the  #
+# planning-advisor exactly as the scout pairs with the scout-reviewer. The      #
+# planner writes TWO artifacts: a plan JSON (machine deliverable and status     #
+# channel) and a human-first plan MD (the user's review surface).               #
+# --------------------------------------------------------------------------- #
+
+
+def assemble_planner_brief(plan_json_path, plan_md_path):
+    """The planner's write-target instruction — its analogue of the scout brief.
+    It names BOTH plan artifacts and nothing else."""
+    return (
+        "Write your plan as TWO files, to exactly these paths:\n"
+        "  JSON (machine deliverable + your status channel): %s\n"
+        "  Markdown (the user's review surface, small scannable sections): %s\n"
+        "Those two plan files are your ONLY write targets. Do not create, edit, "
+        "or delete any other file (reading/searching the repo is fine)."
+        % (plan_json_path, plan_md_path)
+    )
+
+
+def assemble_planner_seed(intel_path, context):
+    """The fresh planner's situational context: the approved scout intel
+    (verbatim JSON) plus the current shared session context."""
+    return (
+        "The scout phase is complete and the user APPROVED the scout intel "
+        "below. Digest it and drive the planning conversation.\n\n"
+        "Approved scout intel:\n%s\n\n"
+        "Current shared context:\n%s" % (_read_text(intel_path).strip(),
+                                         (context or "").strip())
+    )
+
+
+def intel_updated_block(intel_path):
+    """Wake block for a resumed planner after a hand-back round trip: the scout
+    re-ran its full cycle and the user approved the UPDATED intel."""
+    return (
+        "The scout intel changed since you started planning: your hand-back was "
+        "executed, the scout re-investigated, and the user approved the updated "
+        "intel below. Digest it and continue planning. Keep prior plan content "
+        "only where it remains compatible.\n\n"
+        "Updated approved intel:\n%s" % _read_text(intel_path).strip()
+    )
+
+
+def handoff_wake_block(payload):
+    """Wake block for the scout session resumed by a planner hand-back."""
+    return (
+        "The planner handed the work back to you mid-planning (the user "
+        "confirmed the hand-back). Re-run your full cycle: investigate, clarify "
+        "with the user, update your intel file, and set status "
+        "ready_for_review when done.\n\n"
+        "<handoff>\n%s\n</handoff>" % (payload or "").strip()
+    )
+
+
+def handoff_declined_text():
+    """Turn injected into the planner when the user declines the hand-back."""
+    return (
+        "The user DECLINED the hand-back to the scout. Continue planning with "
+        "the current intel; raise anything unresolved with the user directly "
+        "and update your plan status as appropriate."
+    )
+
+
+def assemble_advisor_context(context, selected, plan_json_path, plan_md_path):
+    """The planning-advisor's situational context: the shared session context,
+    the team framing, and BOTH planner artifacts to review."""
+    team = ", ".join(selected) if selected else "(unspecified)"
+    return (
+        "Shared session context — this is the SAME context the planner was "
+        "given:\n%s\n\n"
+        "Team on this session: %s\n\n"
+        "The planner's current plan JSON (the machine source of truth — review "
+        "it critically against the context above):\n%s\n\n"
+        "The planner's current plan markdown (the user's review surface — check "
+        "it stays small, scannable, and consistent with the JSON):\n%s"
+        % (context.strip(), team, _read_text(plan_json_path).strip(),
+           _read_text(plan_md_path).strip())
+    )
+
+
+def assemble_advisor_resume_context(plan_json_path, plan_md_path,
+                                    context_update=None):
+    """Lighter context for a RESUMED planning-advisor session: only the updated
+    plan artifacts — plus a context-update wake block when the session context
+    changed since the advisor last acknowledged it."""
+    body = (
+        "The planner has updated its plan since your last review. Re-review "
+        "both current artifacts below against the current task context, and "
+        "write your verdict to the review file again.\n\n"
+        "Current plan JSON:\n%s\n\n"
+        "Current plan markdown:\n%s"
+        % (_read_text(plan_json_path).strip(), _read_text(plan_md_path).strip())
+    )
+    if context_update:
+        return context_update_block(context_update) + "\n\n" + body
+    return body
+
+
+def make_planning_advisor_runner(plan_md_path, trace=None):
+    """Build the real (non-test) reviewer runner for the planning phase: a
+    `run_reviewer_once` closure carrying the advisor role, prompt, and the
+    dual-artifact context assemblers."""
+    def runner(config, context, selected, plan_json_path, review_path,
+               resume_id=None, on_session=None, context_update=None):
+        return run_reviewer_once(
+            config, context, selected, plan_json_path, review_path,
+            resume_id=resume_id, on_session=on_session,
+            context_update=context_update, trace=trace,
+            reviewer_role=PLANNING_ADVISOR,
+            prompt_path=PLANNING_ADVISOR_PROMPT_PATH,
+            protected="the planner's plan files",
+            context_fn=lambda ctx, sel, p: assemble_advisor_context(
+                ctx, sel, p, plan_md_path),
+            resume_context_fn=lambda p, context_update=None:
+                assemble_advisor_resume_context(
+                    p, plan_md_path, context_update=context_update))
+    return runner
+
+
 def run_reviewer_once(config, context, selected, intel_path, review_path,
                       session_factory=None, claude_spawn=None,
-                      resume_id=None, on_session=None, context_update=None):
-    """Spawn (or resume) the scout-reviewer for one pass and return its verdict.
+                      resume_id=None, on_session=None, context_update=None,
+                      trace=None, reviewer_role=SCOUT_REVIEWER,
+                      prompt_path=None, context_fn=None,
+                      resume_context_fn=None,
+                      protected="the scout intel file"):
+    """Spawn (or resume) a paired reviewer for one pass and return its verdict.
+
+    Role-generic: by default this is the scout-reviewer reviewing the scout
+    intel; the planning phase passes `reviewer_role`, `prompt_path`, and the
+    context assemblers to run the planning-advisor against the planner's plan
+    (`intel_path` is then the plan JSON path).
 
     The reviewer is a PERSISTENT session: its id is captured via `on_session`
     (so cowork can store it) and `resume_id` resumes it on later rounds and on a
     cowork resume, preserving its accumulated context across invocations. A fresh
-    session gets the full context (brief + shared context + intel); a resumed one
-    gets only the updated intel — prefixed with a context-update wake block
-    (`context_update`) when the session context changed since the reviewer last
-    acknowledged it, so a resumed reviewer never operates on stale context.
+    session gets the full context (brief + shared context + artifact); a resumed
+    one gets only the updated artifact — prefixed with a context-update wake
+    block (`context_update`) when the session context changed since the reviewer
+    last acknowledged it, so a resumed reviewer never operates on stale context.
 
     The reviewer writes its verdict to `review_path`; we read it back via
     `state_store.read_review` (the review file is the handoff channel because the
@@ -464,22 +621,32 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     a quiet sink so nothing reaches the user. On any failure or missing/malformed
     file, read_review yields a safe non-approving `revise` (or None, which the
     caller treats as revise)."""
-    cfg = config.get(SCOUT_REVIEWER) or DEFAULTS[SCOUT_REVIEWER]
+    prompt_path = prompt_path or SCOUT_REVIEWER_PROMPT_PATH
+    cfg = config.get(reviewer_role) or DEFAULTS[reviewer_role]
     quiet = _QuietSink()
-    brief = assemble_reviewer_brief(review_path)
+    brief = assemble_reviewer_brief(review_path, protected=protected)
+    if trace:
+        trace.event("review.run.start", role=reviewer_role,
+                    controller=cfg["controller"], resume=bool(resume_id),
+                    intel_path=intel_path, review_path=review_path,
+                    context_update=bool(context_update))
     # The review file is per-pass output, not durable state: clear any previous
     # verdict BEFORE the pass so a reviewer that fails (or never writes) yields
     # None -> safe revise, instead of a stale `approve` from an earlier round
     # being read back as this pass's verdict.
     try:
         os.remove(review_path)
+        if trace:
+            trace.event("review.file.cleared", role=reviewer_role,
+                        review_path=review_path)
     except OSError:
         pass
     if resume_id:
-        ctx_block = assemble_reviewer_resume_context(
+        ctx_block = (resume_context_fn or assemble_reviewer_resume_context)(
             intel_path, context_update=context_update)
     else:
-        ctx_block = assemble_reviewer_context(context, selected, intel_path)
+        ctx_block = (context_fn or assemble_reviewer_context)(
+            context, selected, intel_path)
 
     if cfg["controller"] == "claude":
         cb = (lambda i: on_session("claude", i)) if on_session else None
@@ -487,48 +654,64 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
             session = session_factory("claude", quiet)
         elif resume_id:
             session = bridge.ClaudeSession(
-                SCOUT_REVIEWER_PROMPT_PATH, cfg["mode"], cfg["yolo"],
-                io_out=quiet, speaker="scout-reviewer",
-                resume_id=resume_id, on_session_id=cb)
+                prompt_path, cfg["mode"], cfg["yolo"],
+                io_out=quiet, speaker=reviewer_role,
+                resume_id=resume_id, on_session_id=cb, trace=trace)
         else:
             spawn = claude_spawn or bridge._real_claude_spawn
             ok, _alert = bridge.probe_claude_stream_json(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-                role_prompt_file=SCOUT_REVIEWER_PROMPT_PATH)
+                role_prompt_file=prompt_path, trace=trace,
+                role=reviewer_role)
             if not ok:
-                return state_store.read_review(review_path)
+                verdict = state_store.read_review(review_path)
+                if trace:
+                    trace.event("review.run.end", role=reviewer_role,
+                                result="probe_failed",
+                                verdict=(verdict or {}).get("verdict"))
+                return verdict
             # Pin a known id up front so it is resumable even if killed early.
             sid = str(uuid.uuid4())
             if on_session:
                 on_session("claude", sid)
             session = bridge.ClaudeSession(
-                SCOUT_REVIEWER_PROMPT_PATH, cfg["mode"], cfg["yolo"],
-                io_out=quiet, speaker="scout-reviewer",
-                session_id=sid, on_session_id=cb)
+                prompt_path, cfg["mode"], cfg["yolo"],
+                io_out=quiet, speaker=reviewer_role,
+                session_id=sid, on_session_id=cb, trace=trace)
         first = (brief + "\n\n" + ctx_block).strip()
         try:
             session.send(first)
         finally:
             session.close()
-        return state_store.read_review(review_path)
+        verdict = state_store.read_review(review_path)
+        if trace:
+            trace.event("review.run.end", role=reviewer_role,
+                        result="ok", verdict=(verdict or {}).get("verdict"),
+                        malformed=bool((verdict or {}).get("malformed")))
+        return verdict
 
     # codex (default)
     cb = (lambda i: on_session("codex", i)) if on_session else None
     if resume_id:
         prompt = (brief + "\n\n" + ctx_block).strip()  # thread already has role
     else:
-        prompt = assemble_codex_prompt(read_scout_reviewer_prompt(), brief, ctx_block)
+        prompt = assemble_codex_prompt(_read_text(prompt_path), brief, ctx_block)
     if session_factory:
         session = session_factory("codex", quiet)
     else:
         session = bridge.CodexSession(
-            cfg["mode"], cfg["yolo"], io_out=quiet, speaker="scout-reviewer",
-            resume_thread_id=resume_id, on_thread_id=cb)
+            cfg["mode"], cfg["yolo"], io_out=quiet, speaker=reviewer_role,
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
     try:
         session.send(prompt)
     finally:
         session.close()
-    return state_store.read_review(review_path)
+    verdict = state_store.read_review(review_path)
+    if trace:
+        trace.event("review.run.end", role=reviewer_role, result="ok",
+                    verdict=(verdict or {}).get("verdict"),
+                    malformed=bool((verdict or {}).get("malformed")))
+    return verdict
 
 
 # Banner text producers. The text is rendered through ui.banner (a gum-styled box
@@ -565,6 +748,38 @@ def scout_review_text(intel_path):
 
 def scout_done_text(intel_path):
     return "scout finished — intel → %s" % ui.shorten_path(intel_path)
+
+
+def planner_start_text(plan_md_path, resuming=False):
+    if resuming:
+        head = (
+            "planner — resuming our previous planning session\n"
+            "Picking up where we left off. Ctrl-C aborts."
+        )
+    else:
+        head = (
+            "planner — planning from the approved intel\n"
+            "I'll draft the plan, ask what I need, and mark it ready when we "
+            "agree. You drive — answer my questions. Ctrl-C aborts."
+        )
+    return head + "\nplan → %s" % plan_md_path
+
+
+def planner_needs_input_text():
+    return "planner needs your input"
+
+
+def planner_review_text(plan_md_path):
+    return "plan ready for review — %s" % ui.shorten_path(plan_md_path)
+
+
+def planner_done_text(plan_md_path):
+    return "planner finished — plan approved → %s" % ui.shorten_path(plan_md_path)
+
+
+def handoff_gate_text(payload):
+    return ("planner wants to hand the work back to the scout\n"
+            "handoff note:\n%s" % (payload or "").strip())
 
 
 # Returned by the turn readers to mean "end the conversation" (EOF / Ctrl-D /
@@ -623,36 +838,129 @@ def _dissent_suffix(verdict):
         "  - " + str(f) for f in findings)
 
 
-def _scout_loop(session, first, intel_path, context, io_in, io_out,
-                review_fn=None):
-    """Drive the per-turn loop: send → read intel status → prompt or finish.
+def _read_handoff_confirm(io_in, io_out):
+    """The hand-back confirmation gate. On a TTY an explicit questionary
+    confirm; off a TTY a readline where blank/y/yes confirms (mirrors the
+    blank=approve contract of `_read_review` for the scripted/test path)."""
+    if ui.is_tty(io_in) and ui.is_tty(io_out):
+        return ui.confirm("Hand the work back to the scout?")
+    line = io_in.readline()
+    return line.strip().lower() in ("", "y", "yes")
 
-    Ends when the user approves at `ready_for_review`, hits EOF/Ctrl-D, or types
-    /quit. A blank line re-prompts; Ctrl-C aborts.
 
-    When `review_fn` is provided (the scout-reviewer is on the team), each
-    `ready_for_review` first runs the reviewer (topology D) BEFORE the user gate:
-    `review_fn(intel_path, round_index)` returns a verdict dict
-    {verdict, findings, user_question}. The reviewer is bounded by
-    REVIEW_ROUND_CAP rounds, after which cowork falls through to the user with the
-    reviewer's dissent attached. The reviewer never writes to the user channel;
-    only the content-free `reviewed` marker and the scout's own replies appear."""
+def _role_loop(session, first, status_path, context, io_in, io_out,
+               role="scout", review_fn=None, trace=None,
+               reviewer_role=SCOUT_REVIEWER,
+               needs_input_text=scout_needs_input_text,
+               review_text=scout_review_text,
+               done_text=scout_done_text,
+               artifact_noun="intel",
+               handoff_enabled=False, handoff_confirm=None):
+    """Drive a user-facing role's per-turn loop: send → read status → prompt,
+    gate, or finish. Role-generic: the scout and the planner both run on this
+    loop, differing only in banners, status file, paired reviewer, and whether
+    the hand-back contract is enabled.
+
+    Returns `(rc, outcome, payload)` where outcome is one of:
+      - "approved": the user approved at the `ready_for_review` gate.
+      - "ended": EOF/Ctrl-D or /quit ended the conversation.
+      - "interrupted": Ctrl-C.
+      - "handoff": the role signaled `handoff_back` with a payload and the
+        user CONFIRMED the gate; `payload` carries the handoff note.
+
+    A blank line re-prompts. When `review_fn` is provided (the paired reviewer
+    is on the team), each `ready_for_review` first runs the reviewer (topology
+    D) BEFORE the user gate: `review_fn(status_path, round_index)` returns a
+    verdict dict {verdict, findings, user_question}. The reviewer is bounded by
+    REVIEW_ROUND_CAP rounds, after which cowork falls through to the user with
+    the reviewer's dissent attached. The reviewer never writes to the user
+    channel; only the content-free `reviewed` marker and the role's own replies
+    appear.
+
+    When `handoff_enabled`, a `handoff_back` status with a payload shows the
+    user confirmation gate: confirmed → the loop returns the "handoff" outcome;
+    declined → the status is downgraded and the role continues with a declined
+    note. A `handoff_back` without a payload degrades to the needs-input gate
+    (never an implicit hand-back)."""
     pending = first
+    pending_reopens_work = False
     review_rounds = 0
+    outcome_kind = "ended"
+    payload = None
     try:
         if context.strip():
             io_out.write(ui.label("you", ui.is_tty(io_out)) + context.strip() + "\n")
             io_out.flush()
         while True:
+            if pending_reopens_work:
+                changed = state_store.invalidate_ready_status(status_path)
+                if trace:
+                    trace.event("status.invalidated", role=role,
+                                path=status_path, changed=changed,
+                                from_status="ready_for_review",
+                                to_status="needs_input",
+                                reason="work_reopened")
+                pending_reopens_work = False
+            if trace:
+                trace.event("role.send.start", role=role,
+                            **trace_store.prompt_meta(pending))
             session.send(pending)
-            status = state_store.read_status(intel_path)
+            if trace:
+                trace.event("role.send.end", role=role)
+            status = state_store.read_status(status_path)
+            if trace:
+                trace.event("status.read", role=role, path=status_path,
+                            status=status)
+            if handoff_enabled and status == "handoff_back":
+                note = state_store.read_handoff(status_path)
+                if trace:
+                    trace.event("handoff.signal", role=role, path=status_path,
+                                has_payload=bool(note))
+                if note:
+                    ui.banner(io_out, handoff_gate_text(note), "review")
+                    confirmed = (handoff_confirm or _read_handoff_confirm)(
+                        io_in, io_out)
+                    if trace:
+                        trace.event("handoff.gate", role=role,
+                                    confirmed=bool(confirmed))
+                    if confirmed:
+                        outcome_kind, payload = "handoff", note
+                        break
+                    # Declined: downgrade the stale handoff_back so the status
+                    # file cannot re-trigger the gate, then let the role
+                    # continue planning.
+                    changed = state_store.invalidate_ready_status(
+                        status_path, from_status="handoff_back")
+                    if trace:
+                        trace.event("status.invalidated", role=role,
+                                    path=status_path, changed=changed,
+                                    from_status="handoff_back",
+                                    to_status="needs_input",
+                                    reason="handoff_declined")
+                    pending = handoff_declined_text()
+                    continue
+                # Payload-less handoff_back: degrade to the needs-input gate
+                # (D10) — never an implicit hand-back.
+                status = "needs_input"
             if status == "ready_for_review":
                 dissent = ""
                 # Reviewer gate (topology D): runs transparently before the user.
                 if review_fn is not None and review_rounds < REVIEW_ROUND_CAP:
                     review_rounds += 1
-                    verdict = review_fn(intel_path, review_rounds) or {}
-                    ui.banner(io_out, scout_reviewed_text(), "info")
+                    if trace:
+                        trace.event("review.round.start", role=reviewer_role,
+                                    round=review_rounds,
+                                    round_cap=REVIEW_ROUND_CAP)
+                    verdict = review_fn(status_path, review_rounds) or {}
+                    if trace:
+                        trace.event(
+                            "review.verdict", role=reviewer_role,
+                            round=review_rounds, verdict=verdict.get("verdict"),
+                            has_question=bool(str(
+                                verdict.get("user_question") or "").strip()),
+                            findings_count=len(verdict.get("findings") or []),
+                            malformed=bool(verdict.get("malformed")))
+                    ui.banner(io_out, scout_reviewed_text(verdict), "info")
                     v = verdict.get("verdict")
                     has_question = bool(str(verdict.get("user_question") or "").strip())
                     if v == "approve":
@@ -660,47 +968,104 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
                         review_rounds = 0
                     elif v == "needs_user" and has_question:
                         review_rounds = 0
-                        pending = assemble_reviewer_handoff("needs_user", verdict)
+                        pending = assemble_reviewer_handoff(
+                            "needs_user", verdict, artifact=artifact_noun)
+                        pending_reopens_work = True
+                        if trace:
+                            trace.event("review.handoff", from_role=reviewer_role,
+                                        to_role=role, kind="needs_user")
                         continue
                     else:
                         # revise, an unknown/empty verdict (missing or unreadable
                         # review file), or needs_user without a question: the safe
                         # non-approving default — never silently approve.
                         if review_rounds < REVIEW_ROUND_CAP:
-                            pending = assemble_reviewer_handoff("revise", verdict)
+                            pending = assemble_reviewer_handoff(
+                                "revise", verdict, artifact=artifact_noun)
+                            pending_reopens_work = True
+                            if trace:
+                                trace.event("review.handoff",
+                                            from_role=reviewer_role,
+                                            to_role=role, kind="revise")
                             continue
                         # Cap reached without approval: fall through to the user
                         # with the reviewer's unresolved dissent attached (D5).
                         dissent = _dissent_suffix(verdict)
                         review_rounds = 0
-                ui.banner(io_out, scout_review_text(intel_path) + dissent, "review")
+                        if trace:
+                            trace.event("review.round_cap", role=reviewer_role,
+                                        round_cap=REVIEW_ROUND_CAP)
+                if trace:
+                    trace.event("gate.show", role=role,
+                                gate="ready_for_review", path=status_path,
+                                has_dissent=bool(dissent))
+                ui.banner(io_out, review_text(status_path) + dissent, "review")
                 outcome = _read_review(io_in, io_out)
                 if outcome is _END:
-                    ui.banner(io_out, scout_done_text(intel_path), "done")
+                    if trace:
+                        trace.event("user.action", role=role,
+                                    action="approve", gate="ready_for_review")
+                        trace.event("gate.show", role=role, gate="done",
+                                    path=status_path)
+                    ui.banner(io_out, done_text(status_path), "done")
+                    outcome_kind = "approved"
                     break
                 pending = outcome  # revision feedback → another turn
+                if trace:
+                    trace.event("user.action", role=role, action="revise",
+                                gate="ready_for_review",
+                                **trace_store.prompt_meta(outcome, prefix="input"))
+                pending_reopens_work = True
                 review_rounds = 0  # user re-engaged: fresh review budget
             else:
                 if status == "needs_input":
-                    review_rounds = 0  # scout re-opened work: fresh review budget
-                    ui.banner(io_out, scout_needs_input_text(), "needs_input")
+                    review_rounds = 0  # role re-opened work: fresh review budget
+                    if trace:
+                        trace.event("gate.show", role=role,
+                                    gate="needs_input", path=status_path)
+                    ui.banner(io_out, needs_input_text(), "needs_input")
                 outcome = _read_turn(io_in, io_out)
                 if outcome is _END:
+                    if trace:
+                        trace.event("user.action", role=role, action="eof")
                     break
                 pending = outcome
+                if trace:
+                    trace.event("user.action", role=role, action="answer",
+                                **trace_store.prompt_meta(outcome, prefix="input"))
+                pending_reopens_work = True
     except KeyboardInterrupt:
-        pass
+        if trace:
+            trace.event("role.interrupted", role=role)
+        outcome_kind = "interrupted"
     finally:
         session.close()
-    return 0
+        if trace:
+            trace.event("role.end", role=role, result="closed")
+    return 0, outcome_kind, payload
+
+
+def _scout_loop(session, first, intel_path, context, io_in, io_out,
+                review_fn=None, trace=None, on_outcome=None):
+    """The scout instantiation of `_role_loop` (kept as the historical entry
+    point). Returns 0; the loop outcome is reported via `on_outcome` so
+    `run_flow` can chain into the planning phase on approval."""
+    rc, outcome, _payload = _role_loop(
+        session, first, intel_path, context, io_in, io_out,
+        role="scout", review_fn=review_fn, trace=trace,
+        reviewer_role=SCOUT_REVIEWER)
+    if on_outcome:
+        on_outcome(outcome)
+    return rc
 
 
 def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    reviewer_resume_id=None, on_reviewer_session=None,
-                   context_update=None, on_context_ack=None):
-    """Build the `review_fn` passed to `_scout_loop` when the scout-reviewer is on
-    the team, or None when it is not. The closure runs one reviewer pass and
-    returns its verdict dict.
+                   context_update=None, on_context_ack=None, trace=None,
+                   reviewer_role=SCOUT_REVIEWER):
+    """Build the `review_fn` passed to `_role_loop` when the paired reviewer
+    (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
+    not. The closure runs one reviewer pass and returns its verdict dict.
 
     The reviewer is a persistent session: the first pass creates it (id captured
     and persisted via `on_reviewer_session`); every later pass — within this run
@@ -712,7 +1077,7 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     pass. After the first successful pass, `on_context_ack()` records the
     acknowledgment (and the block is not repeated on later rounds).
     `reviewer_runner` is injectable for tests."""
-    if SCOUT_REVIEWER not in selected or not review_path:
+    if reviewer_role not in selected or not review_path:
         return None
     runner = reviewer_runner or run_reviewer_once
     holder = {"resume_id": reviewer_resume_id,
@@ -726,9 +1091,15 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
             if on_reviewer_session:
                 on_reviewer_session(controller, sid)
 
+        kwargs = {
+            "resume_id": holder["resume_id"],
+            "on_session": capture,
+            "context_update": holder["context_update"],
+        }
+        if trace is not None and reviewer_runner is None:
+            kwargs["trace"] = trace
         verdict = runner(config, context, selected, intel_path, review_path,
-                         resume_id=holder["resume_id"], on_session=capture,
-                         context_update=holder["context_update"])
+                         **kwargs)
         if verdict is not None:
             # The reviewer ran against the current context: acknowledge the
             # revision once and stop repeating the wake block.
@@ -746,7 +1117,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               intel_path=None, session_factory=None, review_path=None,
               reviewer_runner=None, reviewer_resume_id=None,
               on_reviewer_session=None, reviewer_context=None,
-              reviewer_context_update=None, on_reviewer_context_ack=None):
+              reviewer_context_update=None, on_reviewer_context_ack=None,
+              trace=None, on_outcome=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -773,9 +1145,14 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         reviewer_resume_id=reviewer_resume_id,
         on_reviewer_session=on_reviewer_session,
         context_update=reviewer_context_update,
-        on_context_ack=on_reviewer_context_ack)
+        on_context_ack=on_reviewer_context_ack,
+        trace=trace)
     if resume_id and not context.strip():
         context = "Continue the session."
+    if trace:
+        trace.event("role.start", role="scout", controller=cfg["controller"],
+                    resume=bool(resume_id), intel_path=intel_path,
+                    review_path=review_path)
     ui.banner(io_out, scout_start_text(intel_path or "", resuming=bool(resume_id)),
               "start")
     io_out.flush()
@@ -784,9 +1161,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         spawn = claude_spawn or bridge._real_claude_spawn
         ok, alert = bridge.probe_claude_stream_json(
             spawn, mode=cfg["mode"], yolo=cfg["yolo"],
-            role_prompt_file=SCOUT_PROMPT_PATH,
+            role_prompt_file=SCOUT_PROMPT_PATH, trace=trace, role="scout",
         )
         if not ok:
+            if trace:
+                trace.event("role.end", role="scout", result="probe_failed")
             io_out.write("cowork: " + alert + "\n")
             io_out.flush()
             return 1
@@ -807,10 +1186,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             session = bridge.ClaudeSession(
                 SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
                 speaker="scout", session_id=session_id, resume_id=rid,
-                on_session_id=cb)
+                on_session_id=cb, trace=trace)
         first = (brief + "\n\n" + context).strip()
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
-                           review_fn=review_fn)
+                           review_fn=review_fn, trace=trace,
+                           on_outcome=on_outcome)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -823,9 +1203,123 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
     else:
         session = bridge.CodexSession(
             cfg["mode"], cfg["yolo"], io_out=io_out, speaker="scout",
-            resume_thread_id=resume_id, on_thread_id=cb)
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
     return _scout_loop(session, prompt, intel_path, context, io_in, io_out,
-                       review_fn=review_fn)
+                       review_fn=review_fn, trace=trace, on_outcome=on_outcome)
+
+
+def run_planner(config, context, selected, io_in=None, io_out=None,
+                claude_spawn=None, resume_id=None, on_session=None,
+                plan_json_path=None, plan_md_path=None,
+                session_factory=None, review_path=None,
+                reviewer_runner=None, reviewer_resume_id=None,
+                on_reviewer_session=None, reviewer_context=None,
+                reviewer_context_update=None, on_reviewer_context_ack=None,
+                trace=None, handoff_confirm=None, on_outcome=None):
+    """Spin up the planner's CLI and drive the planning loop (the planner
+    instantiation of `_role_loop`).
+
+    `context` is the seed message for this cycle: the approved-intel seed on a
+    fresh chain, a digest wake block after a hand-back round trip, or "" on a
+    plain resume (auto-continue). The plan JSON (`plan_json_path`) doubles as
+    the planner's status channel; `plan_md_path` is the user's review surface.
+    `review_path` + the planning-advisor being on the team enable the advisor
+    gate; `reviewer_runner` overrides the advisor pass (for tests).
+    `on_outcome(outcome, payload)` reports how the loop ended so `run_flow` can
+    execute a confirmed hand-back ("handoff" outcome) or finish the session."""
+    io_in = io_in or sys.stdin
+    io_out = io_out or sys.stdout
+    cfg = config["planner"]
+    brief = assemble_planner_brief(plan_json_path or "", plan_md_path or "")
+    runner = reviewer_runner or make_planning_advisor_runner(
+        plan_md_path, trace=trace)
+    review_fn = make_review_fn(
+        config,
+        reviewer_context if reviewer_context is not None else context,
+        selected, review_path, reviewer_runner=runner,
+        reviewer_resume_id=reviewer_resume_id,
+        on_reviewer_session=on_reviewer_session,
+        context_update=reviewer_context_update,
+        on_context_ack=on_reviewer_context_ack,
+        reviewer_role=PLANNING_ADVISOR)
+    if resume_id and not context.strip():
+        context = "Continue the session."
+    if trace:
+        trace.event("role.start", role="planner", controller=cfg["controller"],
+                    resume=bool(resume_id), plan_json_path=plan_json_path,
+                    plan_md_path=plan_md_path, review_path=review_path)
+    ui.banner(io_out, planner_start_text(plan_md_path or "",
+                                         resuming=bool(resume_id)), "start")
+    io_out.flush()
+
+    def report(outcome, payload):
+        if on_outcome:
+            on_outcome(outcome, payload)
+
+    loop_kwargs = dict(
+        role="planner", review_fn=review_fn, trace=trace,
+        reviewer_role=PLANNING_ADVISOR,
+        needs_input_text=planner_needs_input_text,
+        review_text=lambda _p: planner_review_text(plan_md_path or ""),
+        done_text=lambda _p: planner_done_text(plan_md_path or ""),
+        artifact_noun="plan",
+        handoff_enabled=True, handoff_confirm=handoff_confirm)
+
+    if cfg["controller"] == "claude":
+        spawn = claude_spawn or bridge._real_claude_spawn
+        ok, alert = bridge.probe_claude_stream_json(
+            spawn, mode=cfg["mode"], yolo=cfg["yolo"],
+            role_prompt_file=PLANNER_PROMPT_PATH, trace=trace, role="planner",
+        )
+        if not ok:
+            if trace:
+                trace.event("role.end", role="planner", result="probe_failed")
+            io_out.write("cowork: " + alert + "\n")
+            io_out.flush()
+            report("ended", None)
+            return 1
+        if resume_id:
+            session_id, rid = None, resume_id
+            io_out.write("cowork: resuming claude session %s\n" % resume_id)
+        else:
+            # Pin a known UUID up front so the session is resumable even if the
+            # run is killed immediately.
+            session_id, rid = str(uuid.uuid4()), None
+            if on_session:
+                on_session("claude", session_id)
+        cb = (lambda i: on_session("claude", i)) if on_session else None
+        if session_factory:
+            session = session_factory("claude", session_id=session_id,
+                                      resume_id=rid, on_session_id=cb)
+        else:
+            session = bridge.ClaudeSession(
+                PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
+                speaker="planner", session_id=session_id, resume_id=rid,
+                on_session_id=cb, trace=trace)
+        first = (brief + "\n\n" + context).strip()
+        rc, outcome, payload = _role_loop(
+            session, first, plan_json_path, context, io_in, io_out,
+            **loop_kwargs)
+        report(outcome, payload)
+        return rc
+
+    role_text = _read_text(PLANNER_PROMPT_PATH)
+    prompt = assemble_codex_prompt(role_text, brief, context)
+    if resume_id:
+        io_out.write("cowork: resuming codex session %s\n" % resume_id)
+        prompt = (brief + "\n\n" + context).strip()  # thread already has role
+    cb = (lambda i: on_session("codex", i)) if on_session else None
+    if session_factory:
+        session = session_factory("codex", resume_thread_id=resume_id,
+                                  on_thread_id=cb)
+    else:
+        session = bridge.CodexSession(
+            cfg["mode"], cfg["yolo"], io_out=io_out, speaker="planner",
+            resume_thread_id=resume_id, on_thread_id=cb, trace=trace)
+    rc, outcome, payload = _role_loop(
+        session, prompt, plan_json_path, context, io_in, io_out, **loop_kwargs)
+    report(outcome, payload)
+    return rc
 
 
 # --------------------------------------------------------------------------- #
@@ -833,10 +1327,12 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
 # --------------------------------------------------------------------------- #
 
 
-def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
+def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
+             run_planner_fn=None):
     io_in = io_in or sys.stdin
     io_out = io_out or sys.stdout
     run_scout_fn = run_scout_fn or run_scout
+    run_planner_fn = run_planner_fn or run_planner
     interactive = not _is_non_interactive(args)
 
     # Session store: project-local .cowork/session.json unless disabled.
@@ -850,6 +1346,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
         session_uuid = state_store.get_session_uuid(saved)
     else:
         session_uuid = str(uuid.uuid4())
+    trace = trace_store.Trace(
+        trace_store.trace_path_for(os.path.dirname(spath), session_uuid)
+        if session_enabled else None,
+        session_uuid=session_uuid,
+        enabled=session_enabled,
+    )
+    trace.event("run.start", cwd=os.getcwd(), session_file=spath,
+                session_enabled=session_enabled)
     reuse_config = (session_enabled and state_store.has_config(saved)
                     and not args.team and not args.config)
 
@@ -857,6 +1361,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
     if args.team:
         selected, err = parse_team(args.team)
         if err:
+            trace.event("run.end", rc=2, reason="parse_team_error")
             io_out.write("cowork: " + err + "\n")
             return 2
     elif reuse_config:
@@ -866,6 +1371,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
     else:
         selected = list(ROLES)
     if not selected:
+        trace.event("run.end", rc=0, reason="no_roles_selected")
         io_out.write("cowork: no roles selected; nothing to do.\n")
         return 0
 
@@ -874,6 +1380,7 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
     if args.config:
         ok, err = apply_config_args(config, args.config)
         if not ok:
+            trace.event("run.end", rc=2, reason="config_error")
             io_out.write("cowork: " + err + "\n")
             return 2
     elif reuse_config:
@@ -882,6 +1389,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
         io_out.write("cowork: using saved session config (%s)\n" % spath)
     elif interactive:
         config = configure_roles_interactive(selected)
+    trace.event("run.config", selected=selected, reuse_config=reuse_config,
+                config={r: dict(config[r]) for r in selected if r in config})
 
     # Persist team + config the first time (or whenever freshly chosen).
     if session_enabled and not reuse_config:
@@ -892,101 +1401,263 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None):
     if which is not None:
         kwargs["which"] = which
     ok, alerts = preflight.preflight(config, **kwargs)
+    trace.event("preflight.result", ok=ok, alerts_count=len(alerts))
     if not ok:
+        trace.event("run.end", rc=1, reason="preflight_failed")
         io_out.write("cowork preflight failed:\n")
         for alert in alerts:
             io_out.write("  - " + alert + "\n")
         io_out.flush()
         return 1
 
-    if "scout" not in selected:
-        io_out.write(
-            "cowork: scout not selected. Only the scout role is implemented in "
-            "this version; later roles are not yet available.\n"
-        )
+    # Phase: resume into the persisted phase (default scouting). A persisted
+    # `planning` phase without a planner on the team falls back to scouting.
+    phase = state_store.get_phase(saved) if session_enabled else "scouting"
+    planner_on_team = "planner" in selected
+    if phase == "planning" and not planner_on_team:
+        phase = "scouting"
+    if phase == "scouting" and "scout" not in selected:
+        trace.event("run.end", rc=0, reason="scout_not_selected")
+        if planner_on_team:
+            io_out.write(
+                "cowork: scout not selected. Planning requires approved scout "
+                "intel: add the scout role to the team (a session already in "
+                "the planning phase resumes without re-running the scout).\n")
+        else:
+            io_out.write(
+                "cowork: scout not selected. Only the scouting and planning "
+                "phases are implemented in this version; later roles are not "
+                "yet available.\n")
         return 0
 
-    # Resume saved CLI sessions if they match the current controllers.
-    # Resolved BEFORE the context step so we can skip the goal prompt on a resume.
-    resume_id = None
-    on_session = None
-    reviewer_resume_id = None
-    on_reviewer_session = None
-    if session_enabled:
-        resume_id = state_store.get_role_session(
-            saved, "scout", config["scout"]["controller"])
-        holder = {"state": saved}
+    # Saved CLI session ids per role. With the session store enabled they are
+    # persisted; otherwise they are kept in-run only, so phase chaining (and a
+    # hand-back round trip) can still resume sessions within this run.
+    holder = {"state": saved}
+    local_ids = {}
 
-        def on_session(controller, sid):
-            holder["state"] = state_store.save_role_session(
-                spath, "scout", controller, sid, prior=holder["state"])
+    def role_resume_id(role):
+        if role not in config:
+            return None
+        controller = config[role]["controller"]
+        if session_enabled:
+            return state_store.get_role_session(holder["state"], role, controller)
+        entry = local_ids.get(role)
+        if entry and entry[0] == controller:
+            return entry[1]
+        return None
 
-        if SCOUT_REVIEWER in selected:
-            reviewer_resume_id = state_store.get_role_session(
-                saved, SCOUT_REVIEWER, config[SCOUT_REVIEWER]["controller"])
-
-            def on_reviewer_session(controller, sid):
-                if not sid:
-                    return
+    def role_saver(role):
+        def on_sess(controller, sid):
+            if not sid:
+                return
+            if session_enabled:
                 holder["state"] = state_store.save_role_session(
-                    spath, SCOUT_REVIEWER, controller, sid, prior=holder["state"])
+                    spath, role, controller, sid, prior=holder["state"])
+            local_ids[role] = (controller, sid)
+            trace.event("role.session_saved", role=role,
+                        controller=controller, session_id=sid)
+        return on_sess
+
+    # Resolved BEFORE the context step so we can skip the goal prompt on a
+    # resume of the current phase's user-facing role.
+    lead_role = "planner" if phase == "planning" else "scout"
+    lead_resume_id = role_resume_id(lead_role)
+    if lead_resume_id:
+        trace.event("run.resume", role=lead_role,
+                    controller=config[lead_role]["controller"],
+                    session_id=lead_resume_id, phase=phase)
 
     # Step 3: context. On a resume, skip the goal prompt and auto-continue.
-    context = resolve_context(args, resuming=bool(resume_id))
+    context = resolve_context(args, resuming=bool(lead_resume_id))
 
     # Context invariant: explicit context is a session-wide event. Persist it as
     # the CURRENT session context (bumping the revision when it changed), and
     # make sure every role invoked from here on receives the current revision —
     # fresh sessions get it in their prompt; resumed sessions that have not
     # acknowledged it get an explicit context-update wake block.
-    reviewer_context = context
-    reviewer_context_update = None
-    on_reviewer_context_ack = None
     current_rev = 0
+    current_text = context
     if session_enabled:
         if context.strip():
             holder["state"] = state_store.save_context(
                 spath, context, prior=holder.get("state"))
+            trace.event("context.saved", source="input")
         state = holder["state"]
         current_text = state_store.get_context(state) or ""
         current_rev = state_store.get_context_revision(state)
-        reviewer_context = current_text or context
-        # Scout: a non-empty `context` is delivered in its prompt this run. On a
-        # resume, wrap it in the wake block so a redirect carries the same
-        # "this is the current context, keep prior memory only if compatible"
-        # semantics the reviewer gets; with no new context, deliver any
-        # unacknowledged revision the same way instead of a bare
-        # "Continue the session.".
-        if resume_id and context.strip():
-            context = context_update_block(context)
-        elif resume_id and state_store.role_context_gap(state, "scout"):
-            context = context_update_block(current_text)
-        if SCOUT_REVIEWER in selected:
-            if reviewer_resume_id:
-                reviewer_context_update = state_store.role_context_gap(
-                    state, SCOUT_REVIEWER)
+        trace.event("context.current", revision=current_rev,
+                    has_context=bool(current_text),
+                    context_sha256=(state.get("context") or {}).get("hash")
+                    if isinstance(state.get("context"), dict) else None)
 
-            def on_reviewer_context_ack():
-                holder["state"] = state_store.mark_context_seen(
-                    spath, SCOUT_REVIEWER, current_rev, prior=holder["state"])
+    shared_context = (current_text or context) if session_enabled else context
+
+    def deliver_context(role, seed):
+        """Prepend the current-context wake block to `seed` when `role` is a
+        RESUMED session that has not acknowledged the current revision.
+
+        Applied at EVERY phase invocation — not just the run's initial lead
+        role — so a role re-entered mid-run (a hand-back resuming the scout, a
+        re-approval resuming the planner) never has the revision marked seen
+        without the context actually having been delivered. When the seed is
+        empty or is exactly the (just-saved) context text, the block alone is
+        sent — never the same text twice."""
+        if not session_enabled or not role_resume_id(role):
+            return seed
+        gap = state_store.role_context_gap(holder["state"], role)
+        if not gap:
+            return seed
+        trace.event("context.gap", role=role, revision=current_rev,
+                    delivered=True, reason="phase_invocation")
+        block = context_update_block(gap)
+        seed = (seed or "").strip()
+        if not seed or seed == gap.strip():
+            return block
+        return block + "\n\n" + seed
+
+    def reviewer_gap(reviewer_role):
+        """The context-update wake block for a RESUMED paired reviewer that has
+        not acknowledged the current revision, else None."""
+        if not session_enabled or not role_resume_id(reviewer_role):
+            return None
+        gap = state_store.role_context_gap(holder["state"], reviewer_role)
+        trace.event("context.gap", role=reviewer_role, revision=current_rev,
+                    delivered=bool(gap), reason="reviewer_resume")
+        return gap
+
+    def context_acker(role):
+        if not session_enabled:
+            return None
+
+        def ack():
+            holder["state"] = state_store.mark_context_seen(
+                spath, role, current_rev, prior=holder["state"])
+            trace.event("context.ack", role=role, revision=current_rev)
+        return ack
+
+    def ack_lead(role):
+        # The lead role received the current context in its prompt this run;
+        # record the acknowledgment after a successful run (a crash leaves it
+        # unacknowledged, so the next resume re-delivers the wake block — the
+        # safe direction).
+        if session_enabled and current_rev:
+            holder["state"] = state_store.mark_context_seen(
+                spath, role, current_rev, prior=holder["state"])
+            trace.event("context.ack", role=role, revision=current_rev)
+
+    def set_phase(new_phase):
+        if session_enabled:
+            holder["state"] = state_store.save_phase(
+                spath, new_phase, prior=holder["state"])
+        trace.event("phase.change", **{"from": phase, "to": new_phase})
+        return new_phase
 
     intel_dir = os.path.dirname(spath) if session_enabled else state_store.session_dir()
     intel_path = scout_intel_path(intel_dir, session_uuid)
     review_path = state_store.review_path_for(intel_dir, session_uuid)
-    rc = run_scout_fn(config, context, selected, io_in=io_in, io_out=io_out,
-                      resume_id=resume_id, on_session=on_session,
-                      intel_path=intel_path, review_path=review_path,
-                      reviewer_resume_id=reviewer_resume_id,
-                      on_reviewer_session=on_reviewer_session,
-                      reviewer_context=reviewer_context,
-                      reviewer_context_update=reviewer_context_update,
-                      on_reviewer_context_ack=on_reviewer_context_ack)
-    # The scout received the current context in its prompt this run; record the
-    # acknowledgment after a successful run (a crash leaves it unacknowledged, so
-    # the next resume re-delivers the wake block — safe direction).
-    if session_enabled and rc == 0 and current_rev:
-        holder["state"] = state_store.mark_context_seen(
-            spath, "scout", current_rev, prior=holder["state"])
+    plan_json_path = state_store.planner_plan_json_path_for(intel_dir, session_uuid)
+    plan_md_path = state_store.planner_plan_md_path_for(intel_dir, session_uuid)
+    planner_review_path = state_store.planner_review_path_for(
+        intel_dir, session_uuid)
+
+    # Phase loop: scouting -> (on intel approval, planner on team) planning ->
+    # (on a user-confirmed hand-back) scouting -> ... Plan approval, EOF, or an
+    # interrupt ends the run; the persisted phase makes a rerun resume here.
+    rc = 0
+    scout_seed = context
+    planner_seed = None
+    if phase == "planning":
+        # Resuming into the planning phase. A saved planner session continues
+        # with the (possibly new) context; a planning phase persisted WITHOUT a
+        # planner session id (killed between save_phase and the id save) must
+        # start a fresh planner from the approved intel, not from a bare
+        # context.
+        if role_resume_id("planner"):
+            planner_seed = context
+        else:
+            planner_seed = assemble_planner_seed(intel_path, shared_context)
+    while True:
+        if phase == "scouting":
+            if "scout" not in selected:
+                # Only reachable through a hand-back on a team that resumed into
+                # planning without the scout. The fresh-team case was refused
+                # above.
+                io_out.write(
+                    "cowork: cannot run the scouting phase — scout is not on "
+                    "the team.\n")
+                rc = 2
+                break
+            outcome_box = {"outcome": None}
+            rc = run_scout_fn(
+                config, deliver_context("scout", scout_seed), selected,
+                io_in=io_in, io_out=io_out,
+                resume_id=role_resume_id("scout"),
+                on_session=role_saver("scout"),
+                intel_path=intel_path, review_path=review_path,
+                reviewer_resume_id=role_resume_id(SCOUT_REVIEWER),
+                on_reviewer_session=role_saver(SCOUT_REVIEWER),
+                reviewer_context=shared_context,
+                reviewer_context_update=reviewer_gap(SCOUT_REVIEWER)
+                if SCOUT_REVIEWER in selected else None,
+                on_reviewer_context_ack=context_acker(SCOUT_REVIEWER),
+                trace=trace,
+                on_outcome=lambda o: outcome_box.update(outcome=o))
+            if rc == 0:
+                ack_lead("scout")
+            if (rc == 0 and outcome_box["outcome"] == "approved"
+                    and planner_on_team):
+                phase = set_phase("planning")
+                # A planner session that already exists (hand-back round trip,
+                # or a crash after planning started) digests the updated intel;
+                # a fresh one is seeded with the approved intel + context.
+                if role_resume_id("planner"):
+                    planner_seed = intel_updated_block(intel_path)
+                else:
+                    planner_seed = assemble_planner_seed(
+                        intel_path, shared_context)
+                continue
+            break
+
+        # planning phase
+        planner_box = {"outcome": None, "payload": None}
+        rc = run_planner_fn(
+            config,
+            deliver_context("planner",
+                            planner_seed if planner_seed is not None else ""),
+            selected, io_in=io_in, io_out=io_out,
+            resume_id=role_resume_id("planner"),
+            on_session=role_saver("planner"),
+            plan_json_path=plan_json_path, plan_md_path=plan_md_path,
+            review_path=planner_review_path,
+            reviewer_resume_id=role_resume_id(PLANNING_ADVISOR),
+            on_reviewer_session=role_saver(PLANNING_ADVISOR),
+            reviewer_context=shared_context,
+            reviewer_context_update=reviewer_gap(PLANNING_ADVISOR)
+            if PLANNING_ADVISOR in selected else None,
+            on_reviewer_context_ack=context_acker(PLANNING_ADVISOR),
+            trace=trace,
+            on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+        if rc == 0:
+            ack_lead("planner")
+        if rc == 0 and planner_box["outcome"] == "handoff":
+            # User-confirmed hand-back (planner -> its pre-processor): resume
+            # the scout session with the handoff payload and run the full scout
+            # cycle again.
+            phase = set_phase("scouting")
+            trace.event("handoff.execute", from_role="planner",
+                        to_role=HANDBACK_PREPROCESSOR["planner"],
+                        **trace_store.prompt_meta(
+                            planner_box["payload"] or "", prefix="payload"))
+            scout_seed = handoff_wake_block(planner_box["payload"])
+            planner_seed = None
+            continue
+        # Plan approval is terminal for this run (the phase stays `planning`,
+        # so a rerun resumes the planner conversation), and EOF/interrupt ends
+        # the run the same way the scout loop always has.
+        break
+
+    trace.event("run.end", rc=rc)
     return rc
 
 

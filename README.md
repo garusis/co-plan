@@ -4,25 +4,32 @@
 up the controller CLI you pick for each role (`claude` or `codex`), and bridges
 that CLI's conversation straight to you.
 
-This release implements the **foundation** and the **first two roles**:
+This release implements the **foundation** and the **first two phases**:
 
 - the entry flow (choose your team, configure each role, give context),
-- the **scout** role — a context gatherer that explores the work and confirms a
-  solid starting point before any planning or implementation begins, and
-- the **scout-reviewer** role — a critical reviewer paired with the scout that
-  checks, before anything reaches you for approval, that the scout's questions,
-  assumptions, and discoveries are actually aligned with the goal.
+- the **scouting phase** — the **scout** (a context gatherer that explores the
+  work and confirms a solid starting point) paired with the **scout-reviewer**
+  (a critical reviewer that checks, before anything reaches you for approval,
+  that the scout's questions, assumptions, and discoveries are actually aligned
+  with the goal), and
+- the **planning phase** — the **planner** (turns the approved intel into an
+  implementation plan, delivered as a machine-readable plan JSON plus a
+  human-first plan markdown) paired with the **planning-advisor** (a critical
+  reviewer of the plan with the same verdict semantics as the scout-reviewer).
 
-The other roles (revisor, planner, advisor, builder) are named and reserved but
-not yet implemented.
+Phases form a **loop**, not a one-way chain: approving the scout's intel chains
+straight into planning in the same run, and mid-planning the planner can hand
+the work back to the scout through a confirmation gate (see
+[Phases and the hand-back](#phases-and-the-hand-back)). The remaining roles
+(revisor, builder) are named and reserved but not yet implemented.
 
 ## How it works
 
 `cowork` is a standalone executable that owns your terminal. When you run it:
 
-1. **Choose your team.** A checkbox menu of roles (`scout`, `revisor`,
-   `planner`, `advisor`, `builder`), all checked by default. Space toggles,
-   Enter confirms.
+1. **Choose your team.** A checkbox menu of roles (`scout`, `scout-reviewer`,
+   `revisor`, `planner`, `planning-advisor`, `builder`), all checked by default.
+   Space toggles, Enter confirms.
 2. **Configure each role.** Accept the defaults in one keystroke, or pick which
    roles to customize and choose a controller (`claude`/`codex`), a yolo
    (permission-bypass) toggle, and a mode (`plan`/`implement`) for each.
@@ -173,16 +180,20 @@ Defaults per role:
 | scout-reviewer | codex | on | implement |
 | revisor | codex | on | implement |
 | planner | claude | on | implement |
-| advisor | codex | on | implement |
+| planning-advisor | codex | on | implement |
 | builder | claude | on | implement |
 
 Roles default to **implement** mode (write-enabled). They are kept in their lane
 by **role-spec guardrails**, not by plan mode — e.g. the scout may write only its
-intel file, and the scout-reviewer only its review file (see below). This is
+intel file, the scout-reviewer only its review file, the planner only its two
+plan files, and the planning-advisor only its review file (see below). This is
 instruction-level confinement, not an OS sandbox.
 
-Only `scout` and `scout-reviewer` run in this release; selecting a team without
-`scout` exits with a note that the other roles are not yet available.
+The scouting and planning phases run in this release. A **fresh** team without
+`scout` exits with a note: planning starts from approved scout intel, so the
+planner needs the scout ahead of it (a session already in the planning phase
+resumes without re-running the scout). Selecting only reserved roles exits with
+a not-yet-available note.
 
 ## Sessions
 
@@ -190,15 +201,20 @@ Only `scout` and `scout-reviewer` run in this release; selecting a team without
 the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
 
 - a **cowork session UUID** (`session_uuid`) — minted once per session, distinct
-  from any claude/codex session id. It names this session's assets, e.g. the
-  scout intel file `.cowork/scout.intel.<session_uuid>.json` and the review file
-  `.cowork/scout-review.<session_uuid>.json`;
+  from any claude/codex session id. It names this session's assets: the scout
+  intel file `.cowork/scout.intel.<session_uuid>.json`, the review file
+  `.cowork/scout-review.<session_uuid>.json`, the planner's plan files
+  `.cowork/planner.plan.<session_uuid>.json` / `.md`, the planning-advisor's
+  review file `.cowork/planner-review.<session_uuid>.json`, and the private
+  orchestration trace `.cowork/trace.<session_uuid>.jsonl`;
 - the **team** and **per-role config** — so the next run in the same directory
   does not re-ask them (you'll see `using saved session config`);
+- the **current phase** (`scouting`/`planning`) — so a killed run resumes into
+  the phase it was in (see [Phases and the hand-back](#phases-and-the-hand-back));
 - each role's **CLI session id** (claude `session_id` / codex `thread_id`) —
-  the scout's and the scout-reviewer's — so a run that is killed can be
-  **resumed where it left off**, with the reviewer keeping its accumulated
-  review context too; and
+  scout, scout-reviewer, planner, and planning-advisor — so a run that is
+  killed can be **resumed where it left off**, with the reviewers keeping their
+  accumulated review context too; and
 - the **current session context**, versioned (see below).
 
 On the next run, if a saved session exists, `cowork` reuses the config and
@@ -208,12 +224,28 @@ On the next run, if a saved session exists, `cowork` reuses the config and
 resumable.
 
 On a resume, `cowork` **skips the goal prompt and continues automatically** —
-it sends "Continue the session." so the scout picks up where it left off with its
-prior context. To **redirect** the resumed session to a new task, pass
-`--context "…"`; to **start fresh**, use `--no-session` (or delete
+it sends "Continue the session." so the current phase's role picks up where it
+left off with its prior context. To **redirect** the resumed session to a new
+task, pass `--context "…"`; to **start fresh**, use `--no-session` (or delete
 `.cowork/session.json`). `--session-file` points at a different store. Changing
 the saved config is out of scope for now — delete
 `.cowork/session.json` to start fresh.
+
+### Orchestration trace
+
+Each persisted session run appends private structured events to
+`.cowork/trace.<session_uuid>.jsonl` (`--no-session` stays ephemeral and does not
+write a trace). This trace does **not** duplicate Claude or Codex transcripts;
+those controller CLIs already keep their own local logs. Instead, cowork records
+the missing orchestration layer: when a controller was invoked, whether it was
+fresh or resumed, which non-content params were used, which artifact
+status/verdict was read, which gate was shown, and why stale state was
+invalidated.
+
+Prompt-like content is recorded only as `*_sha256` + `*_bytes`; argv entries that
+would contain prompt bodies are replaced with `<prompt>`. The trace is intended
+for local debugging with the `cowork-debug` skill, not for terminal output or a
+shareable transcript.
 
 ### Context revisions
 
@@ -299,15 +331,87 @@ read back):
   answer.
 
 **Single voice:** the scout is the only role that talks to you. The reviewer is
-not a secret — you'll see a small `reviewed` marker each time it runs — but its
-raw output never interleaves into the conversation; its questions reach you only
-through the scout's faithful relay. Full spec:
+not a secret — you'll see a small `reviewed: ...` status marker each time it runs
+— but its raw output never interleaves into the conversation; its questions
+reach you only through the scout's faithful relay. Full spec:
 [roles/scout-reviewer.md](roles/scout-reviewer.md).
 
 The reviewer is a **persistent session** like the scout: its CLI session id is
 saved and resumed on every pass and across cowork resumes, and it participates in
 [context revisions](#context-revisions) — a resumed reviewer that hasn't seen the
 latest `--context` gets it as an explicit update block on its next pass.
+
+## The planner role
+
+When you approve the scout's intel and `planner` is on the team, cowork chains
+straight into the planning phase **in the same run**: the planner is seeded with
+the approved intel JSON plus the current shared context, and becomes the single
+voice you talk to. Like the scout, it runs a dialogue — it asks the decisions
+only you can make (scope, behavior, tradeoffs) as they appear, and marks the
+plan ready when it is decision-complete.
+
+The planner produces **two artifacts** (its only write targets):
+
+- `.cowork/planner.plan.<session_uuid>.json` — the **machine deliverable** and
+  source of truth for downstream roles, carrying the dense engineering detail:
+  goal-coverage mapping, decisions with rationale, file/symbol-cited evidence,
+  per-file change lists, and the test inventory. Its top level mirrors the
+  scout intel (`{session, role, status, handoff?, result}`) and doubles as the
+  planner's status channel
+  (`needs_input | ready_for_review | handoff_back`).
+- `.cowork/planner.plan.<session_uuid>.md` — the **human-first plan** you review
+  at the plan gate: TL;DR; What we're building; Key decisions; How it will
+  work; What changes; How we'll know it works; Out of scope; Risks &
+  assumptions. Sections stay small and scannable; when you want deeper detail,
+  ask the planner — it answers conversationally from the JSON instead of
+  inflating the markdown.
+
+At the plan gate you get the same approve/decline flow as the scout's: decline
+with feedback and the planner keeps revising; approve and the session ends
+(**plan approval is terminal** — there is no builder yet; rerunning `cowork`
+resumes the planner conversation like any other resume). Full spec:
+[roles/planner.md](roles/planner.md).
+
+## The planning-advisor role
+
+The planning-advisor pairs with the planner exactly as the scout-reviewer pairs
+with the scout: each time the planner marks the plan `ready_for_review`, cowork
+deterministically runs the advisor against **both** plan artifacts before
+showing you the gate. Same verdict semantics — `approve` proceeds to your gate,
+`revise` findings go back to the planner (bounded to 2 rounds, then the gate is
+shown with the advisor's unresolved notes attached; never a hard block),
+`needs_user` questions reach you only through the planner's faithful relay, and
+a missing/malformed verdict counts as `revise`. Its only write target is
+`.cowork/planner-review.<session_uuid>.json`, cleared before each pass. Full
+spec: [roles/planning-advisor.md](roles/planning-advisor.md).
+
+## Phases and the hand-back
+
+The session phase (`scouting`/`planning`) is persisted in
+`.cowork/session.json`, and the flow is a **loop**:
+
+```text
+scouting ──(you approve the intel; planner on team)──▶ planning ──(you approve the plan)──▶ done (run ends)
+   ▲                                                      │
+   └────────(you confirm the planner's hand-back)─────────┘
+```
+
+Mid-planning, the planner can **hand the work back to the scout** — say you
+realize the implementation is too complex and want to reduce scope or redirect
+the research. The planner writes a handoff note (what changed, what to
+re-investigate, what to keep) and signals `handoff_back`; cowork shows you an
+explicit confirmation gate. On yes, the **same scout session resumes**, woken
+with the handoff note, and runs its full cycle again — investigation,
+clarifications, scout-reviewer check, your approval gate. When you approve the
+updated intel, the **same planner session resumes**, woken with the updated
+intel to digest, and planning continues. On no, the planner is told and keeps
+planning. A `handoff_back` without a note degrades to the normal needs-input
+prompt — never an implicit hand-back.
+
+The signal contract is role-generic (any role → its pre-processor); only
+planner → scout is wired this iteration. A killed run resumes into the
+persisted phase: a session mid-planning re-enters the planner conversation
+directly, without re-running the scout.
 
 ### Interacting with scout — the three states
 
@@ -321,8 +425,10 @@ Each turn, cowork streams the reply, then reads the intel `status`:
   shows a `scout needs your input` panel and waits for your answer.
 - **`ready_for_review`** — scout finished the intel and posts a **summary in the
   chat**. If the scout-reviewer is on the team it runs first (you'll see a
-  `reviewed` marker; see [The scout-reviewer role](#the-scout-reviewer-role)),
-  then cowork shows an explicit approve/revise gate. On a terminal this is
+  `reviewed: approved`, `reviewed: changes requested`, or
+  `reviewed: needs user input` marker; see
+  [The scout-reviewer role](#the-scout-reviewer-role)), then cowork shows an
+  explicit approve/revise gate. On a terminal this is
   a questionary confirm (**Approve & finish?**): confirm ends the session; decline
   opens an editor for revision feedback, which sends another turn so you keep
   refining.
@@ -351,13 +457,16 @@ piped/scripted runs fall back to plain text and `readline`.
 |-- cowork                      # executable entry point
 |-- roles
 |   |-- scout.md                # scout role spec (preloaded into the controller)
-|   `-- scout-reviewer.md       # scout-reviewer role spec (critical review + verdict schema)
+|   |-- scout-reviewer.md       # scout-reviewer role spec (critical review + verdict schema)
+|   |-- planner.md              # planner role spec (dual plan artifacts + hand-back contract)
+|   `-- planning-advisor.md     # planning-advisor role spec (plan critique + verdict schema)
 `-- scripts
-    |-- cowork.py               # entry flow (questionary menus + args path) + scout/reviewer orchestration
+    |-- cowork.py               # entry flow (questionary menus + args path) + phase loop + role orchestration
     |-- cowork_bridge.py        # flag assembly, stream-json framing, codex resume, probe
     |-- cowork_ui.py            # shared UX layer: prompt_toolkit input, Rich markdown/panels, color
     |-- cowork_preflight.py     # Python-version + pip-package + controller PATH checks
-    |-- cowork_state.py         # .cowork/session.json store (config, session ids, context revisions, review verdicts)
+    |-- cowork_trace.py         # private JSONL orchestration trace writer
+    |-- cowork_state.py         # .cowork/session.json store (config, phase, session ids, context revisions, verdicts)
     `-- test_cowork.py          # unit + live integration tests
 ```
 
@@ -372,10 +481,14 @@ python3 -m unittest scripts/test_cowork.py
 The unit tests cover flag assembly, preflight (including the pip-package check),
 the menus (via injected ask-callables — no questionary prompt or TTY needed), the
 non-interactive args path, the claude stream-json probe, event parsing, denial
-handling, the plan-only fallthrough, and that `cowork` stays self-contained. Tests
-that exercise the real rich/prompt_toolkit libraries skip when the packages aren't
-installed (like the `COWORK_LIVE` tests); install `requirements.txt` to run them.
-The real terminal experience (live markdown, the editor, panels) is a manual check.
+handling, the plan-only fallthrough, the phase loop (scout→planner chaining, the
+hand-back round trip, resume-into-planning, the scout-less refusal), the planner
+loop and planning-advisor gate (via injected fakes), and that `cowork` stays
+self-contained. Tests that exercise the real rich/prompt_toolkit libraries skip
+when the packages aren't installed (like the `COWORK_LIVE` tests); install
+`requirements.txt` to run them. The real terminal experience (live markdown, the
+editor, panels) is a manual check — as is one live end-to-end phase loop:
+scout → approve → planner → hand back → scout → approve → planner → approve.
 
 ### Live integration tests
 
