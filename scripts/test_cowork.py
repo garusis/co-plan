@@ -86,6 +86,90 @@ class FlagAssemblyTest(unittest.TestCase):
         # resume rejects --sandbox (policy inherited from the original session).
         self.assertNotIn("--sandbox", cmd)
 
+    def _add_dir_pair(self, cmd):
+        # Return the (flag, value) pair following --add-dir, or None.
+        if "--add-dir" not in cmd:
+            return None
+        i = cmd.index("--add-dir")
+        return (cmd[i], cmd[i + 1])
+
+    def test_claude_command_extra_writable_dir(self):
+        # Granted on BOTH the fresh (session_id) and resume (resume_id) forms.
+        fresh = bridge.build_claude_command(
+            "roles/scout.md", "implement", False, session_id="sid",
+            extra_writable_dir="/home/u/.cowork/sessions/S")
+        self.assertEqual(self._add_dir_pair(fresh),
+                         ("--add-dir", "/home/u/.cowork/sessions/S"))
+        resume = bridge.build_claude_command(
+            "roles/scout.md", "implement", False, resume_id="rid",
+            extra_writable_dir="/home/u/.cowork/sessions/S")
+        self.assertEqual(self._add_dir_pair(resume),
+                         ("--add-dir", "/home/u/.cowork/sessions/S"))
+        # Byte-identical to today when the param is omitted/None.
+        self.assertEqual(
+            bridge.build_claude_command("roles/scout.md", "implement", False,
+                                        session_id="sid"),
+            bridge.build_claude_command("roles/scout.md", "implement", False,
+                                        session_id="sid",
+                                        extra_writable_dir=None))
+        self.assertNotIn(
+            "--add-dir",
+            bridge.build_claude_command("roles/scout.md", "implement", False,
+                                        session_id="sid"))
+
+    def test_codex_command_extra_writable_dir(self):
+        cmd = bridge.build_codex_command(
+            "PROMPT", "implement", False,
+            extra_writable_dir="/home/u/.cowork/sessions/S")
+        self.assertEqual(self._add_dir_pair(cmd),
+                         ("--add-dir", "/home/u/.cowork/sessions/S"))
+        self.assertEqual(cmd[-1], "PROMPT")  # prompt stays last
+        # Byte-identical to today when the param is omitted/None.
+        self.assertEqual(
+            bridge.build_codex_command("PROMPT", "implement", False),
+            bridge.build_codex_command("PROMPT", "implement", False,
+                                       extra_writable_dir=None))
+        self.assertNotIn(
+            "--add-dir",
+            bridge.build_codex_command("PROMPT", "implement", False))
+
+    def test_codex_resume_command_never_grants_add_dir(self):
+        # Resume inherits the fresh session's sandbox and cannot re-grant a root;
+        # it takes no extra_writable_dir param and never carries --add-dir.
+        cmd = bridge.build_codex_resume_command("thread-abc", "next")
+        self.assertNotIn("--add-dir", cmd)
+
+
+class StatusSpinnerTest(unittest.TestCase):
+    def test_returns_fn_value_and_runs_it(self):
+        seen = {}
+
+        def fn():
+            seen["ran"] = True
+            return "verdict"
+
+        out = io.StringIO()  # not a TTY
+        result = cowork._with_status_spinner(out, "reviewing", fn)
+        self.assertEqual(result, "verdict")
+        self.assertTrue(seen["ran"])
+
+    def test_noop_off_tty_writes_nothing(self):
+        # ui.Spinner is TTY-gated, so off a TTY the helper must add zero bytes —
+        # the scripted/test path stays byte-identical.
+        out = io.StringIO()
+        cowork._with_status_spinner(out, "reading repo state", lambda: None)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_stops_spinner_even_when_fn_raises(self):
+        # The spinner is torn down in a finally, so an exception still leaves a
+        # clean stream (and off a TTY, nothing was written).
+        out = io.StringIO()
+        with self.assertRaises(ValueError):
+            cowork._with_status_spinner(
+                out, "starting scout",
+                lambda: (_ for _ in ()).throw(ValueError("boom")))
+        self.assertEqual(out.getvalue(), "")
+
 
 class PreflightTest(unittest.TestCase):
     def test_python_floor(self):
@@ -774,14 +858,16 @@ class DenialTest(unittest.TestCase):
 class FallthroughTest(unittest.TestCase):
     def test_brief_with_planner(self):
         brief = cowork.assemble_scout_brief(
-            ["scout", "planner"], ".cowork/scout.intel.S.json")
+            ["scout", "planner"],
+            "/home/u/.cowork/sessions/S/scout.intel.S.json")
         self.assertIn("do NOT produce a plan", brief)
-        self.assertIn(".cowork/scout.intel.S.json", brief)
+        self.assertIn("/home/u/.cowork/sessions/S/scout.intel.S.json", brief)
         self.assertIn("ONLY write target", brief)
 
     def test_brief_without_planner(self):
         brief = cowork.assemble_scout_brief(
-            ["scout", "planning-advisor"], ".cowork/scout.intel.S.json")
+            ["scout", "planning-advisor"],
+            "/home/u/.cowork/sessions/S/scout.intel.S.json")
         self.assertIn("lightweight plan", brief)
 
     def test_brief_requires_json(self):
@@ -3452,8 +3538,11 @@ class PhaseChainFlowTest(unittest.TestCase):
     def _write_intel(self, spath):
         saved = state_store.load(spath)
         suid = state_store.get_session_uuid(saved)
-        intel = os.path.join(os.path.dirname(spath),
+        # Produced artifacts now live under the session-assets home, not the
+        # project-local .cowork dir (which keeps only session.json).
+        intel = os.path.join(state_store.session_assets_dir(suid),
                              "scout.intel.%s.json" % suid)
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review",
                        "result": {"finding": "F1"}}, fh)
@@ -3466,7 +3555,8 @@ class PhaseChainFlowTest(unittest.TestCase):
 
         # Pre-create the session so the intel file exists when the seed is built.
         state_store.ensure_session(spath, None, "S")
-        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        intel = os.path.join(state_store.session_assets_dir("S"),
+                             "scout.intel.S.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review",
@@ -3554,7 +3644,8 @@ class PhaseChainFlowTest(unittest.TestCase):
         # warn per dirty root, and enumerate every root in the note.
         spath = self._tmp_session()
         state_store.ensure_session(spath, None, "S")
-        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        intel = os.path.join(state_store.session_assets_dir("S"),
+                             "scout.intel.S.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review", "result": {}}, fh)
@@ -3634,7 +3725,8 @@ class PhaseChainFlowTest(unittest.TestCase):
             ["approved", "approved"],
             [("handoff", "narrow scope to auth"), ("approved", None)])
         state_store.ensure_session(spath, None, "S")
-        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        intel = os.path.join(state_store.session_assets_dir("S"),
+                             "scout.intel.S.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review", "result": {}}, fh)
@@ -3758,7 +3850,9 @@ class PhaseChainFlowTest(unittest.TestCase):
             spath, ["scout", "planner"],
             cowork.default_config(["scout", "planner"]), prior=state)
         state = state_store.save_phase(spath, "planning", prior=state)
-        intel = os.path.join(os.path.dirname(spath), "scout.intel.S.json")
+        intel = os.path.join(state_store.session_assets_dir("S"),
+                             "scout.intel.S.json")
+        os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review",
                        "result": {"finding": "F1"}}, fh)
@@ -3867,6 +3961,26 @@ class EvalStateStoreTest(_EvalEnvMixin, unittest.TestCase):
         self.assertEqual(path, os.path.join(
             os.path.expanduser(os.path.join("~", ".cowork", "sessions")),
             "S1", "scores.json"))
+
+    def test_session_assets_dir_honors_env_root(self):
+        root = self._scores_root()
+        self.assertEqual(state_store.session_assets_dir("S1"),
+                         os.path.join(root, "S1"))
+        # scores live inside the assets dir.
+        self.assertEqual(
+            os.path.dirname(state_store.scores_path_for("S1")),
+            state_store.session_assets_dir("S1"))
+
+    def test_session_assets_dir_defaults_to_home(self):
+        old = os.environ.pop("COWORK_SESSIONS_ROOT", None)
+        if old is not None:
+            self.addCleanup(
+                lambda: os.environ.__setitem__("COWORK_SESSIONS_ROOT", old))
+        self.assertEqual(
+            state_store.session_assets_dir("S1"),
+            os.path.join(
+                os.path.expanduser(os.path.join("~", ".cowork", "sessions")),
+                "S1"))
 
     def test_read_eval_missing_and_malformed(self):
         d = self._cowork_dir()
@@ -5460,7 +5574,9 @@ class BuildPhaseFlowTest(unittest.TestCase):
 
     def _prime_intel_and_plan(self, spath, suid):
         state_store.ensure_session(spath, None, suid)
-        base = os.path.dirname(spath)
+        # Produced artifacts now live under the session-assets home, not the
+        # project-local .cowork dir (which keeps only session.json).
+        base = state_store.session_assets_dir(suid)
         os.makedirs(base, exist_ok=True)
         with open(os.path.join(base, "scout.intel.%s.json" % suid), "w") as fh:
             json.dump({"status": "ready_for_review", "result": {}}, fh)
