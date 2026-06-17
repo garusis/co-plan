@@ -54,6 +54,12 @@ your status channel. Fixed top-level shape:
 }
 ```
 
+> **Backup check (secondary — not your primary safety net):** before you tell
+> the user in chat that the plan is complete, re-read the **literal** `status`
+> field on disk in the plan JSON and confirm it actually says
+> `ready_for_review`. cowork gates only on that on-disk field, never on what you
+> say in chat; if the two drift, rewrite the file so they agree.
+
 `result` is yours to structure, but it must carry the dense engineering detail:
 
 - Goal coverage: every requirement, success criterion, failure mode, and
@@ -65,6 +71,31 @@ your status channel. Fixed top-level shape:
   execute without re-deriving your reasoning.
 - Test inventory: unit, integration, regression, and manual checks.
 - Risks being accepted and the assumptions an implementer may rely on.
+- The repository set: **carry `result.repos` forward verbatim** from the scout's
+  confirmed intel (the user-chosen subset). When the intel spans more than one
+  repo, **repo-qualify every per-file change** (name which root the path lives
+  in, e.g. an absolute path or `<root>`-relative) so the builder writes to the
+  right tree, and anchor every verification command to its repo via `git -C
+  <root>` / that repo's working dir — not a generic "repo root".
+
+#### Verification commands
+
+Record `result.verification` as a list of `{label, command}` objects naming the
+concrete verification steps the build phase should run (tests, typecheck, lint,
+build) — the exact shell commands, anchored to the repo they run in (a repo's
+working dir or `git -C <root>`) when the plan spans more than one repo. It may be
+empty
+when none apply. The builder is contracted to run each of these during its
+self-audit and to block its own `ready_for_review` while any of them fails for a
+reason it introduced. Name commands that actually exist in this repo; do not
+invent a test runner that is not configured.
+
+```json
+"verification": [
+  {"label": "unit tests", "command": "python3 -m pytest scripts/test_cowork.py"},
+  {"label": "preflight", "command": "cowork --check"}
+]
+```
 
 Keep the file current — overwrite it as the plan sharpens.
 

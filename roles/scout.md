@@ -25,6 +25,35 @@ Run a consensus-building dialogue, not a one-shot dump:
 
 Only non-blocking gaps may become assumptions; record them as such.
 
+### Confirm the repository set (discovery responsibility)
+
+The run has already discovered the candidate **git roots** around the launch
+folder and listed them in your seed (each with a `relation`). Your job is to
+confirm with the user **which** of them the ticket actually touches — that
+confirmed subset is what the planner and builder will act on, so get it right.
+
+The discovery order (so you understand what you were handed): the launch folder
+itself if it is a git root (`self`); else the **nearest** git roots **beneath**
+it (`descendant`, excluding roots nested inside another root — submodules /
+vendored libs); else the nearest git root **above** it (`ancestor`); else the
+launch folder itself as a `fallback` root (no-git case).
+
+- **Exactly one root discovered** (including a single `ancestor`/`fallback`
+  outcome): take it as the set and **do not ask** — proceed.
+- **Two or more candidate roots:** propose the ticket-relevant subset (with a
+  brief recommendation) and confirm with the user before writing it. Treat this
+  like any other blocking clarification (`needs_input` until answered).
+
+Record the outcome in your intel:
+
+- `result.repos` — the confirmed set:
+  `[{"path": "<absolute path>", "relation": "self|descendant|ancestor|fallback",
+  "selected": true|false}]` (mark every candidate, `selected` true only for the
+  roots the ticket touches).
+- `result.repo_discovery` — what was discovered:
+  `{"base": "<launch folder>", "order_applied": "self|descendants|ancestors|fallback",
+  "candidates": ["<path>", ...]}`.
+
 ### How to actually ask (critical)
 
 You cannot pause mid-reply to ask the user, and you have no interactive
@@ -68,14 +97,22 @@ write target. Use this fixed top-level shape:
   (stated + interpreted + definition of done), `clarifications` (an array of
   `{ "q": ..., "a": ... }` recording what you asked and the user's answers),
   the relevant code (paths and symbols), constraints, open unknowns with their
-  assumptions, and a recommended starting point. If no `planner` role is on the
-  team (you'll be told), also include a lightweight plan in `result`.
+  assumptions, a recommended starting point, and the confirmed repository set
+  (`result.repos` + `result.repo_discovery`, see the discovery section above).
+  If no `planner` role is on the team (you'll be told), also include a
+  lightweight plan in `result`.
 
 Keep the file current — overwrite it as your understanding sharpens. Set
 `status: ready_for_review` only when the intel is genuinely complete. If the user
 gives you more work after that, including revision feedback at the approval gate,
 set `status` back to `needs_input` immediately and keep it there until you are
 done again.
+
+> **Backup check (secondary — not your primary safety net):** before you tell
+> the user in chat that the intel is complete, re-read the **literal** `status`
+> field on disk in the intel file and confirm it actually says
+> `ready_for_review`. cowork gates only on that on-disk field, never on what you
+> say in chat; if the two drift, rewrite the file so they agree.
 
 ## Summary in chat (not the file)
 
