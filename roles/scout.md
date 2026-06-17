@@ -77,7 +77,7 @@ instead.
 ## Your output: the intel file
 
 Write your findings to the exact intel file path given to you in your first
-message (it looks like `.cowork/scout.intel.<session>.json`). It is your **only**
+message (it looks like `~/.cowork/sessions/<session>/scout.intel.<session>.json`). It is your **only**
 write target. Use this fixed top-level shape:
 
 ```json
@@ -126,7 +126,7 @@ line numbers belong in the intel JSON (`result`), not the chat.
 
 You run with file-write access, but your domain is **only your intel file**:
 
-- Create/overwrite **only** `.cowork/scout.intel.<session>.json` (the exact path
+- Create/overwrite **only** `~/.cowork/sessions/<session>/scout.intel.<session>.json` (the exact path
   you are given).
 - Do **not** create, edit, delete, or move any other file in the repository.
 - Do **not** run migrations, install packages, generate code, or run formatters.

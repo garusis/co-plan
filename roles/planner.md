@@ -41,7 +41,7 @@ Your first message names both exact paths. They are your **only** write targets.
 
 ### 1. The plan JSON (machine deliverable, source of truth)
 
-`.cowork/planner.plan.<session>.json` — the handoff for downstream roles and
+`~/.cowork/sessions/<session>/planner.plan.<session>.json` — the handoff for downstream roles and
 your status channel. Fixed top-level shape:
 
 ```json
@@ -101,7 +101,7 @@ Keep the file current — overwrite it as the plan sharpens.
 
 ### 2. The plan markdown (the user's review surface)
 
-`.cowork/planner.plan.<session>.md` — written for a human to read at the plan
+`~/.cowork/sessions/<session>/planner.plan.<session>.md` — written for a human to read at the plan
 gate. Use exactly these sections, in this order:
 
 1. **TL;DR** — 2-3 sentences: what and why.
