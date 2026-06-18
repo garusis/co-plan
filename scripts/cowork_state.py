@@ -34,9 +34,11 @@ of being discarded.
 Python 3.9+, stdlib only. Does not import co_plan_file.py.
 """
 
+import glob
 import hashlib
 import json
 import os
+import time
 
 VERSION = 1
 DIR_NAME = ".cowork"
@@ -49,6 +51,106 @@ def session_dir(cwd=None):
 
 def session_path(cwd=None):
     return os.path.join(session_dir(cwd), FILE_NAME)
+
+
+def new_session_path(cwd, session_uuid):
+    """Path of a per-session state file `.cowork/session.<uuid>.json`. Each
+    cowork session in a directory gets its own file so many sessions coexist;
+    the legacy single `session.json` (see `session_path`) is still discovered
+    in place."""
+    return os.path.join(session_dir(cwd), "session.%s.json" % session_uuid)
+
+
+def _uuid_from_filename(path):
+    """Extract the uuid encoded in a `session.<uuid>.json` name, or None for the
+    legacy `session.json` (which carries no uuid in its name)."""
+    base = os.path.basename(path)
+    if base == FILE_NAME:
+        return None
+    if base.startswith("session.") and base.endswith(".json"):
+        mid = base[len("session."):-len(".json")]
+        return mid or None
+    return None
+
+
+def discover_session_files(cwd=None):
+    """Return the sorted list of per-directory session files: every
+    `.cowork/session.*.json` plus the legacy `.cowork/session.json` if present.
+    A directory glob — no registry/index file to keep in sync."""
+    d = session_dir(cwd)
+    found = set(glob.glob(os.path.join(d, "session.*.json")))
+    legacy = os.path.join(d, FILE_NAME)
+    if os.path.exists(legacy):
+        found.add(legacy)
+    return sorted(found)
+
+
+def derive_summary(state, max_len=72):
+    """Short human label derived lazily from the stored goal: the first
+    non-empty line of the context text, internal whitespace collapsed and
+    truncated with an ellipsis. None when the session has no context text
+    (the caller falls back to `fallback_label`)."""
+    text = get_context(state)
+    if not text:
+        return None
+    for raw in str(text).splitlines():
+        line = " ".join(raw.split())
+        if line:
+            if len(line) > max_len:
+                return line[:max_len - 1].rstrip() + "…"
+            return line
+    return None
+
+
+def fallback_label(session_uuid, created_or_mtime=None):
+    """Deterministic label for a session with no derivable summary: a short id
+    plus, when a timestamp is given, a formatted local time. Used in the picker
+    so an empty-goal or pre-context session is still identifiable."""
+    short = (session_uuid or "????????")[:8]
+    label = "session %s" % short
+    if created_or_mtime:
+        label += " · " + time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(created_or_mtime))
+    return label
+
+
+def list_sessions(cwd=None):
+    """Return the directory's sessions, newest-first, as a list of dicts
+    `{id, path, summary, phase, created, last_active}`.
+
+    Each discovered file is loaded (unreadable/incompatible files are skipped,
+    never raised). `id` is the persisted `session_uuid`, falling back to the
+    uuid parsed from a `session.<uuid>.json` name; a legacy `session.json` with
+    neither is skipped. `summary` is `derive_summary` (None when no context).
+    `last_active` is the file mtime (every atomic save refreshes it); `created`
+    is the persisted mint-time epoch (None for legacy files). Ordered
+    newest-first by `last_active or created`, tie-broken by `created`."""
+    out = []
+    for path in discover_session_files(cwd):
+        state = load(path)
+        if state is None:
+            continue
+        sid = get_session_uuid(state) or _uuid_from_filename(path)
+        if not sid:
+            continue
+        try:
+            last_active = os.path.getmtime(path)
+        except OSError:
+            last_active = None
+        created = state.get("created")
+        out.append({
+            "id": sid,
+            "path": path,
+            "summary": derive_summary(state),
+            "phase": get_phase(state),
+            "created": created,
+            "last_active": last_active,
+        })
+    out.sort(
+        key=lambda s: (s["last_active"] or s["created"] or 0,
+                       s["created"] or 0),
+        reverse=True)
+    return out
 
 
 def load(path):
@@ -476,6 +578,7 @@ def ensure_session(path, prior, new_uuid):
     state = dict(prior or {})
     if not state.get("session_uuid"):
         state["session_uuid"] = new_uuid
+        state.setdefault("created", time.time())
         state.setdefault("team", [])
         state.setdefault("config", {})
         state.setdefault("sessions", {})

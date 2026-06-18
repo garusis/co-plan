@@ -20,6 +20,7 @@ import or modify co_plan_file.py.
 """
 
 import argparse
+import collections
 import contextlib
 import datetime
 import glob
@@ -28,6 +29,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -272,6 +274,12 @@ def build_parser():
                    help="path to the session store (default: ./.cowork/session.json)")
     p.add_argument("--no-session", action="store_true",
                    help="do not read or write the session store")
+    p.add_argument("--new", action="store_true",
+                   help="start a fresh session, skipping the resume-or-new "
+                        "prompt (prior sessions stay intact)")
+    p.add_argument("--resume", action="store_true",
+                   help="open the session picker for this directory (newest "
+                        "first); needs an interactive terminal")
     return p
 
 
@@ -2841,6 +2849,127 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Session selection.                                                           #
+#                                                                              #
+# A directory holds many resumable sessions (each its own                     #
+# .cowork/session.<uuid>.json, plus a legacy .cowork/session.json discovered   #
+# in place). `select_session` decides which one this run uses BEFORE any       #
+# team/config/phase logic, from the flags and the directory's existing         #
+# sessions. Its result is an explicit tri-state so --no-session runs the flow  #
+# while only a user dismissal returns rc 0.                                    #
+# --------------------------------------------------------------------------- #
+
+# path: chosen session-file path (None only on error/cancel). new_uuid: the
+# minted uuid on a New path (so run_flow names the file and the internal
+# session_uuid identically), else None. cancelled: user dismissed a picker/menu
+# (benign rc 0). error: a message for a conflicting/invalid invocation (rc 2).
+SessionChoice = collections.namedtuple(
+    "SessionChoice", ["path", "new_uuid", "cancelled", "error"])
+SessionChoice.__new__.__defaults__ = (None, None, False, None)
+
+
+def _session_picker_label(row, now):
+    """Compose a picker row: '<relative time> · <phase> — <summary|fallback>'."""
+    when = ui.format_relative_time(row.get("last_active") or row.get("created"),
+                                   now)
+    summary = row.get("summary") or state_store.fallback_label(
+        row.get("id"), row.get("created") or row.get("last_active"))
+    return "%s · %s — %s" % (when, row.get("phase") or "scouting", summary)
+
+
+def select_session(args, io_in, io_out, select_fn=None, now=None):
+    """Decide which session this run uses. Returns a SessionChoice.
+
+    Decision order (conflicts FIRST, before any path resolution, so an explicit
+    --session-file never bypasses them):
+      1. --new + --resume          -> error
+         --no-session + --resume   -> error
+      2. --no-session              -> run the flow with the default/explicit
+                                      path; never read/written (ephemeral).
+      3. --session-file            -> single-session mode (no discovery/picker).
+      4. discover the directory's sessions.
+      5. --new                     -> mint a fresh uuid + per-session path.
+      6. --resume                  -> picker (errors with no sessions or no TTY).
+      7. no flag                   -> zero sessions: mint fresh; non-interactive:
+                                      most-recent; interactive: Resume/New menu.
+    """
+    select_fn = select_fn or ui.select
+    if now is None:
+        now = time.time()
+
+    # 1. Conflict checks first (before --session-file / --no-session / discovery).
+    if args.new and args.resume:
+        return SessionChoice(error="--new and --resume cannot be combined.")
+    if args.no_session and args.resume:
+        return SessionChoice(
+            error="--resume cannot be combined with --no-session "
+                  "(there is no session to resume).")
+
+    # 2. --no-session: not cancelled, not error — the flow still runs with an
+    # ephemeral session; the path is computed exactly as today but never read or
+    # written because session_enabled stays False downstream.
+    if args.no_session:
+        return SessionChoice(
+            path=args.session_file or state_store.session_path())
+
+    # 3. --session-file forces single-session mode: operate on that exact file,
+    # skipping discovery and the picker (preserves existing scripts/tests).
+    if args.session_file:
+        return SessionChoice(path=args.session_file)
+
+    cwd = os.getcwd()
+    interactive_picker_ok = (not _is_non_interactive(args)
+                             and ui.is_tty(io_in) and ui.is_tty(io_out))
+
+    # 4. Discover this directory's sessions (newest-first).
+    discovered = state_store.list_sessions(cwd)
+
+    def mint_new():
+        u = str(uuid.uuid4())
+        return SessionChoice(path=state_store.new_session_path(cwd, u),
+                             new_uuid=u)
+
+    def run_picker():
+        choices = [(row["path"], _session_picker_label(row, now))
+                   for row in discovered]
+        chosen = select_fn("Resume which session?", choices)
+        if not chosen:
+            return SessionChoice(cancelled=True)
+        return SessionChoice(path=chosen)
+
+    # 5. --new: skip the prompt, fresh session.
+    if args.new:
+        return mint_new()
+
+    # 6. --resume: jump straight to the picker.
+    if args.resume:
+        if not discovered:
+            return SessionChoice(
+                error="--resume: no sessions to resume in %s."
+                      % state_store.session_dir(cwd))
+        if not interactive_picker_ok:
+            return SessionChoice(
+                error="--resume needs an interactive terminal; direct resume "
+                      "by id is out of scope.")
+        return run_picker()
+
+    # 7. No flag.
+    if not discovered:
+        return mint_new()  # nothing to resume -> start fresh, no prompt
+    if not interactive_picker_ok:
+        # Piped/scripted: continue the most-recent session (today's behavior).
+        return SessionChoice(path=discovered[0]["path"])
+    choice = select_fn("Resume an existing session or start a new one?",
+                       [("resume", "Resume an existing session"),
+                        ("new", "Start a new session")])
+    if choice == "resume":
+        return run_picker()
+    if choice == "new":
+        return mint_new()
+    return SessionChoice(cancelled=True)  # menu dismissed
+
+
 def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
              run_planner_fn=None, run_builder_fn=None):
     io_in = io_in or sys.stdin
@@ -2855,14 +2984,36 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # baseline must be read from the same cwd to match what they see.
     run_cwd = os.getcwd()
 
-    # Session store: project-local .cowork/session.json unless disabled.
+    # Session store: select which of the directory's sessions this run uses
+    # (resume-or-new prompt, --new/--resume, picker) BEFORE any team/config/phase
+    # logic. The result is an explicit tri-state: error -> rc 2; cancelled -> rc 0
+    # (benign); else proceed with the chosen path.
     session_enabled = not args.no_session
-    spath = args.session_file or state_store.session_path()
+    choice = select_session(args, io_in, io_out)
+    if choice.error or choice.cancelled:
+        # No session was chosen, so there is no session_uuid to key a trace on:
+        # record run.end under an ephemeral uuid (only when persistence is on)
+        # so these early exits are still traced, exactly as the plan prescribes.
+        eph_uuid = str(uuid.uuid4())
+        etrace = trace_store.Trace(
+            trace_store.trace_path_for(eph_uuid) if session_enabled else None,
+            session_uuid=eph_uuid, enabled=session_enabled)
+        if choice.error:
+            etrace.event("run.end", rc=2, reason="session_select_error")
+            io_out.write("cowork: " + choice.error + "\n")
+            return 2
+        etrace.event("run.end", rc=0, reason="session_select_cancelled")
+        io_out.write("cowork: cancelled; nothing to do.\n")
+        return 0
+    spath = choice.path
     saved = state_store.load(spath) if session_enabled else None
     # cowork session UUID (distinct from any claude/codex session id): names this
-    # session's assets, e.g. the scout intel file.
+    # session's assets, e.g. the scout intel file. On a New path, reuse the uuid
+    # select_session minted into the filename so the filename uuid, the internal
+    # session_uuid, and the ~/.cowork/sessions/<uuid>/ assets key always agree.
     if session_enabled:
-        saved = state_store.ensure_session(spath, saved, str(uuid.uuid4()))
+        saved = state_store.ensure_session(
+            spath, saved, choice.new_uuid or str(uuid.uuid4()))
         session_uuid = state_store.get_session_uuid(saved)
     else:
         session_uuid = str(uuid.uuid4())

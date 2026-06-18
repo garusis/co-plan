@@ -670,6 +670,38 @@ def prompt_user(io_in, io_out, header=None, session_factory=None):
     return (text or "").rstrip("\n")
 
 
+def format_relative_time(epoch, now):
+    """Compact relative timestamp for picker rows: 'just now', '5m ago',
+    '3h ago', '2d ago', '3w ago', '5mo ago', '2y ago'. ALWAYS relative — no
+    absolute date for old sessions (the approved picker contract). `now` is
+    passed in (not read from the clock) so picker labels are deterministic under
+    test. A missing/zero epoch yields 'unknown'."""
+    if not epoch:
+        return "unknown"
+    delta = now - epoch
+    if delta < 0:
+        delta = 0
+    if delta < 45:
+        return "just now"
+    minutes = int(delta // 60)
+    if minutes < 60:
+        return "%dm ago" % max(1, minutes)
+    hours = int(delta // 3600)
+    if hours < 24:
+        return "%dh ago" % hours
+    days = int(delta // 86400)
+    if days < 7:
+        return "%dd ago" % days
+    weeks = int(delta // 604800)
+    if weeks < 5:
+        return "%dw ago" % weeks
+    months = int(delta // 2592000)  # 30-day months
+    if months < 12:
+        return "%dmo ago" % max(1, months)
+    years = int(delta // 31536000)  # 365-day years
+    return "%dy ago" % max(1, years)
+
+
 def confirm(prompt, ask_fn=None):
     """Yes/No gate. On a TTY: questionary.confirm. `ask_fn` is injectable for tests
     and returns a bool (or None, treated as False)."""
