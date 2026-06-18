@@ -22,9 +22,11 @@ import or modify co_plan_file.py.
 import argparse
 import contextlib
 import datetime
+import glob
 import hashlib
 import json
 import os
+import shutil
 import sys
 import uuid
 
@@ -309,7 +311,91 @@ def scout_intel_path(intel_dir, session_uuid):
     return os.path.join(intel_dir, "scout.intel.%s.json" % session_uuid)
 
 
-def assemble_scout_brief(selected, intel_path):
+# --------------------------------------------------------------------------- #
+# Optional caveman compression: detected once on the cowork side and injected   #
+# as a one-line writing-style directive into each role's and reviewer's brief    #
+# (Q3) — deterministic, identical for claude and codex, never a role self-check. #
+# --------------------------------------------------------------------------- #
+
+
+def _caveman_available():
+    """Whether the optional caveman terse-style tool is installed.
+
+    Mirrors `co_plan_file.dependency_status()['caveman']['available']` WITHOUT
+    importing co_plan_file: cowork must stay additive (the boundary is enforced
+    by `test_cowork_does_not_import_co_plan_file` and the module docstring), so
+    the small detector is duplicated here rather than imported. Cheap — a few
+    `shutil.which` lookups plus path-existence checks — and run at brief
+    assembly, i.e. effectively at session start."""
+    for command in ("caveman", "caveman-compress", "caveman-shrink"):
+        if shutil.which(command) is not None:
+            return True
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, ".claude", "skills", "caveman", "SKILL.md"),
+        os.path.join(home, ".claude", "skills", "cavecrew", "SKILL.md"),
+        os.path.join(home, ".claude", "plugins", "caveman", "SKILL.md"),
+        os.path.join(home, ".claude", "plugins", "caveman",
+                     ".claude-plugin", "plugin.json"),
+        os.path.join(home, ".codex", "skills", "caveman", "SKILL.md"),
+        os.path.join(home, ".codex", "skills", "cavecrew", "SKILL.md"),
+        os.path.join(home, ".codex", "plugins", "caveman", "SKILL.md"),
+        os.path.join(home, ".codex", "plugins", "caveman",
+                     ".codex-plugin", "plugin.json"),
+        os.path.join(home, ".agents", "skills", "caveman", "SKILL.md"),
+        os.path.join(home, ".agents", "skills", "cavecrew", "SKILL.md"),
+        os.path.join(home, ".config", "caveman"),
+    ]
+    extra = os.environ.get("COPLAN_CAVEMAN_PATHS", "")
+    for value in extra.split(os.pathsep):
+        value = value.strip()
+        if value:
+            candidates.append(value)
+    if any(os.path.exists(p) for p in candidates):
+        return True
+    for base, pattern in (
+        (os.path.join(home, ".claude", "skills"), "*caveman*/SKILL.md"),
+        (os.path.join(home, ".claude", "skills"), "*cavecrew*/SKILL.md"),
+        (os.path.join(home, ".codex", "skills"), "*caveman*/SKILL.md"),
+        (os.path.join(home, ".codex", "skills"), "*cavecrew*/SKILL.md"),
+        (os.path.join(home, ".agents", "skills"), "*caveman*/SKILL.md"),
+        (os.path.join(home, ".agents", "skills"), "*cavecrew*/SKILL.md"),
+    ):
+        if glob.glob(os.path.join(base, pattern)):
+            return True
+    return False
+
+
+def caveman_directive(available=None):
+    """The one-line compression directive appended to every role/reviewer brief.
+
+    A WRITING-STYLE instruction only: it never invokes /caveman and never
+    changes any global mode. Internal/peer content is compressed only when
+    caveman is installed; user-facing content is always full prose. `available`
+    defaults to live detection; tests pass it explicitly."""
+    if available is None:
+        available = _caveman_available()
+    if available:
+        return (
+            "Compression directive: the caveman terse-style tool IS installed. "
+            "Write all INTERNAL-channel content — your `[[internal]]` "
+            "self-narration, and for reviewers your whole review narration — in "
+            "terse caveman ultra style (drop articles/filler/pleasantries, "
+            "fragments OK), preserving every bit of technical substance and any "
+            "required structure. NEVER compress user-facing content: your "
+            "replies to the user stay full, clear prose. Do not invoke /caveman "
+            "or change any global mode."
+        )
+    return (
+        "Compression directive: the caveman terse-style tool is NOT installed. "
+        "Write everything — user-facing and internal-channel alike — in normal, "
+        "full prose. Internal-channel content still routes to the internal "
+        "channel (inside `[[internal]]` blocks, or for reviewers your whole "
+        "narration), just uncompressed."
+    )
+
+
+def assemble_scout_brief(selected, intel_path, caveman_available=None):
     """Dynamic first-message brief for the scout: where to write, the JSON +
     domain guardrail, and the plan-only fallthrough for this team."""
     if "planner" in selected:
@@ -327,7 +413,7 @@ def assemble_scout_brief(selected, intel_path):
         "  %s\n"
         "That intel file is your ONLY write target. Do not create, edit, or "
         "delete any other file (reading/searching the repo is fine).\n"
-        "%s" % (intel_path, plan_note)
+        "%s\n\n%s" % (intel_path, plan_note, caveman_directive(caveman_available))
     )
 
 
@@ -361,7 +447,8 @@ def read_scout_reviewer_prompt(path=SCOUT_REVIEWER_PROMPT_PATH):
         return fh.read()
 
 
-def assemble_reviewer_brief(review_path, protected="the scout intel file"):
+def assemble_reviewer_brief(review_path, protected="the scout intel file",
+                            caveman_available=None):
     """The reviewer's write-target instruction — its analogue of the scout brief.
     It points at the review file only (never the reviewed artifact, named by
     `protected`)."""
@@ -371,7 +458,8 @@ def assemble_reviewer_brief(review_path, protected="the scout intel file"):
         "That review file is your ONLY write target. Do NOT edit %s "
         "or any other file (reading/searching the repo is fine). Use the "
         "verdict schema from your role (verdict: approve|revise|needs_user, "
-        "findings, and user_question when needs_user)." % (review_path, protected)
+        "findings, and user_question when needs_user).\n\n%s"
+        % (review_path, protected, caveman_directive(caveman_available))
     )
 
 
@@ -876,7 +964,7 @@ def assemble_reviewer_resume_context(intel_path, context_update=None):
 # --------------------------------------------------------------------------- #
 
 
-def assemble_planner_brief(plan_json_path, plan_md_path):
+def assemble_planner_brief(plan_json_path, plan_md_path, caveman_available=None):
     """The planner's write-target instruction — its analogue of the scout brief.
     It names BOTH plan artifacts and nothing else."""
     return (
@@ -884,8 +972,8 @@ def assemble_planner_brief(plan_json_path, plan_md_path):
         "  JSON (machine deliverable + your status channel): %s\n"
         "  Markdown (the user's review surface, small scannable sections): %s\n"
         "Those two plan files are your ONLY write targets. Do not create, edit, "
-        "or delete any other file (reading/searching the repo is fine)."
-        % (plan_json_path, plan_md_path)
+        "or delete any other file (reading/searching the repo is fine).\n\n%s"
+        % (plan_json_path, plan_md_path, caveman_directive(caveman_available))
     )
 
 
@@ -942,7 +1030,7 @@ def handoff_declined_text():
 # --------------------------------------------------------------------------- #
 
 
-def assemble_builder_brief(build_status_path):
+def assemble_builder_brief(build_status_path, caveman_available=None):
     """The builder's status-file instruction. Unlike the scout/planner, the
     builder's write target is the WHOLE REPO (it edits source to execute the
     plan); the status file named here is only its status/verification channel,
@@ -954,8 +1042,8 @@ def assemble_builder_brief(build_status_path):
         "handoff, and the result.verification log) — NOT a restriction on what "
         "you may edit. You execute the approved plan by editing the repository "
         "itself. Do NOT run any git commit or PR/branch tooling: approval ends "
-        "the run and leaves the changes in the working tree for the user."
-        % build_status_path
+        "the run and leaves the changes in the working tree for the user.\n\n%s"
+        % (build_status_path, caveman_directive(caveman_available))
     )
 
 
@@ -1053,13 +1141,13 @@ def make_planning_advisor_runner(plan_md_path, trace=None,
     (now outside cwd) succeed on the no-yolo path."""
     def runner(config, context, selected, plan_json_path, review_path,
                resume_id=None, on_session=None, context_update=None,
-               eval_scratch_path=None, eval_specs=None):
+               eval_scratch_path=None, eval_specs=None, surface_io_out=None):
         return run_reviewer_once(
             config, context, selected, plan_json_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
-            extra_writable_dir=extra_writable_dir,
+            extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
             reviewer_role=PLANNING_ADVISOR,
             prompt_path=PLANNING_ADVISOR_PROMPT_PATH,
             protected="the planner's plan files",
@@ -1068,6 +1156,10 @@ def make_planning_advisor_runner(plan_md_path, trace=None,
             resume_context_fn=lambda p, context_update=None:
                 assemble_advisor_resume_context(
                     p, plan_md_path, context_update=context_update))
+    # Marks this as a real run_reviewer_once closure (vs. a test-injected
+    # reviewer_runner) so make_review_fn forwards surface_io_out only to runners
+    # that accept it — test runners keep a byte-identical signature.
+    runner._coplan_surface_capable = True
     return runner
 
 
@@ -1374,13 +1466,13 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
     per-root capture recipe)."""
     def runner(config, context, selected, build_status_path, review_path,
                resume_id=None, on_session=None, context_update=None,
-               eval_scratch_path=None, eval_specs=None):
+               eval_scratch_path=None, eval_specs=None, surface_io_out=None):
         return run_reviewer_once(
             config, context, selected, build_status_path, review_path,
             resume_id=resume_id, on_session=on_session,
             context_update=context_update, trace=trace,
             eval_scratch_path=eval_scratch_path, eval_specs=eval_specs,
-            extra_writable_dir=extra_writable_dir,
+            extra_writable_dir=extra_writable_dir, surface_io_out=surface_io_out,
             reviewer_role=BUILD_REVIEWER,
             prompt_path=BUILD_REVIEWER_PROMPT_PATH,
             protected="the builder's working-tree delta and status file",
@@ -1392,6 +1484,8 @@ def make_build_reviewer_runner(plan_json_path, plan_md_path, baseline_note="",
                     plan_json_path, plan_md_path, p,
                     context_update=context_update, baseline_note=baseline_note,
                     baseline_repos=baseline_repos))
+    # See make_planning_advisor_runner: marks a real surface-capable closure.
+    runner._coplan_surface_capable = True
     return runner
 
 
@@ -1435,7 +1529,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                       resume_context_fn=None,
                       protected="the scout intel file",
                       eval_scratch_path=None, eval_specs=None,
-                      extra_writable_dir=None):
+                      extra_writable_dir=None, surface_io_out=None):
     """Spawn (or resume) a paired reviewer for one pass and return its verdict.
 
     Role-generic: by default this is the scout-reviewer reviewing the scout
@@ -1460,6 +1554,12 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     prompt_path = prompt_path or SCOUT_REVIEWER_PROMPT_PATH
     cfg = config.get(reviewer_role) or DEFAULTS[reviewer_role]
     quiet = _QuietSink()
+    # When `surface_io_out` is set the REVIEW turn streams to the user on the
+    # wholly-internal (dim) channel under the reviewer's own label; otherwise it
+    # goes to the quiet sink, byte-identical to the historical hidden behavior.
+    # The reviewer's peer-eval send always stays muted (D-eval-stays-muted).
+    surface = surface_io_out is not None
+    review_io = surface_io_out if surface else quiet
     brief = assemble_reviewer_brief(review_path, protected=protected)
     if trace:
         trace.event("review.run.start", role=reviewer_role,
@@ -1487,11 +1587,11 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     if cfg["controller"] == "claude":
         cb = (lambda i: on_session("claude", i)) if on_session else None
         if session_factory:
-            session = session_factory("claude", quiet)
+            session = session_factory("claude", review_io)
         elif resume_id:
             session = bridge.ClaudeSession(
                 prompt_path, cfg["mode"], cfg["yolo"],
-                io_out=quiet, speaker=reviewer_role,
+                io_out=review_io, speaker=reviewer_role, internal=surface,
                 resume_id=resume_id, on_session_id=cb, trace=trace,
                 extra_writable_dir=extra_writable_dir)
         else:
@@ -1513,15 +1613,18 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 on_session("claude", sid)
             session = bridge.ClaudeSession(
                 prompt_path, cfg["mode"], cfg["yolo"],
-                io_out=quiet, speaker=reviewer_role,
+                io_out=review_io, speaker=reviewer_role, internal=surface,
                 session_id=sid, on_session_id=cb, trace=trace,
                 extra_writable_dir=extra_writable_dir)
         first = (brief + "\n\n" + ctx_block).strip()
         try:
             session.send(first)
             verdict = state_store.read_review(review_path)
-            _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
-                               eval_specs, trace=trace)
+            # The eval send must never reach the user even when the review turn
+            # is surfaced: mute the session around it (D-eval-stays-muted).
+            with _muted_session(session) if surface else contextlib.nullcontext():
+                _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
+                                   eval_specs, trace=trace)
         finally:
             session.close()
         if trace:
@@ -1537,17 +1640,19 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     else:
         prompt = assemble_codex_prompt(_read_text(prompt_path), brief, ctx_block)
     if session_factory:
-        session = session_factory("codex", quiet)
+        session = session_factory("codex", review_io)
     else:
         session = bridge.CodexSession(
-            cfg["mode"], cfg["yolo"], io_out=quiet, speaker=reviewer_role,
-            resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
-            extra_writable_dir=extra_writable_dir)
+            cfg["mode"], cfg["yolo"], io_out=review_io, speaker=reviewer_role,
+            internal=surface, resume_thread_id=resume_id, on_thread_id=cb,
+            trace=trace, extra_writable_dir=extra_writable_dir)
     try:
         session.send(prompt)
         verdict = state_store.read_review(review_path)
-        _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
-                           eval_specs, trace=trace)
+        # Keep the eval send muted even when the review turn is surfaced.
+        with _muted_session(session) if surface else contextlib.nullcontext():
+            _run_reviewer_eval(session, reviewer_role, eval_scratch_path,
+                               eval_specs, trace=trace)
     finally:
         session.close()
     if trace:
@@ -2055,14 +2160,12 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                         trace.event("review.round.start", role=reviewer_role,
                                     round=review_rounds,
                                     round_cap=REVIEW_ROUND_CAP)
-                    # The whole reviewer pass runs muted (probe + review turn +
-                    # the reviewer's own peer-eval all stream to a quiet sink),
-                    # so the user would otherwise sit on a static screen. Raise a
-                    # 'reviewing…' indicator on the real io_out for its duration;
-                    # the helper stops the spinner before the banner write below.
-                    verdict = _with_status_spinner(
-                        io_out, "reviewing",
-                        lambda: review_fn(status_path, review_rounds)) or {}
+                    # The review turn now streams on the internal channel (the
+                    # bridge raises its own pre-first-token spinner on io_out);
+                    # no outer \r-frame spinner here — it would collide with the
+                    # Live region the bridge opens on the same io_out. The muted
+                    # probe/eval inside the pass need no visible spinner.
+                    verdict = review_fn(status_path, review_rounds) or {}
                     if trace:
                         trace.event(
                             "review.verdict", role=reviewer_role,
@@ -2209,7 +2312,8 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    reviewer_role=SCOUT_REVIEWER, phase=None,
                    eval_scratch_path=None, scores_path=None,
                    session_uuid=None, intel_path=None, planning_epoch=None,
-                   consumed_upstream=None, extra_writable_dir=None):
+                   consumed_upstream=None, extra_writable_dir=None,
+                   surface_io_out=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -2266,6 +2370,15 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
         # the grant in themselves; test runners get nothing (byte-identical).
         if reviewer_runner is None and extra_writable_dir is not None:
             kwargs["extra_writable_dir"] = extra_writable_dir
+        # Surface the review turn on the internal channel. The default
+        # scout-reviewer path calls run_reviewer_once directly (reviewer_runner
+        # is None); the planner/builder real runners are marked surface-capable.
+        # Test-injected runners are neither, so they receive no new kwarg and
+        # stay byte-identical.
+        if surface_io_out is not None and (
+                reviewer_runner is None
+                or getattr(runner, "_coplan_surface_capable", False)):
+            kwargs["surface_io_out"] = surface_io_out
         specs = None
         if eval_enabled and evaluatee:
             specs = [{
@@ -2367,7 +2480,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         on_context_ack=on_reviewer_context_ack,
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
-        extra_writable_dir=sessions_dir)
+        extra_writable_dir=sessions_dir, surface_io_out=io_out)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -2486,7 +2599,7 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
         intel_path=intel_path, planning_epoch=planning_epoch,
-        extra_writable_dir=sessions_dir)
+        extra_writable_dir=sessions_dir, surface_io_out=io_out)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -2630,7 +2743,8 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         reviewer_role=BUILD_REVIEWER, phase="building",
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
-        consumed_upstream=consumed, extra_writable_dir=sessions_dir)
+        consumed_upstream=consumed, extra_writable_dir=sessions_dir,
+        surface_io_out=io_out)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(

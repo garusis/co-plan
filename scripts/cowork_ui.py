@@ -162,16 +162,143 @@ def _rich_console(io_out, size=None):
                    width=cols, height=rows)
 
 
-def render_markdown(io_out, text, enabled=None):
+# --------------------------------------------------------------------------- #
+# Channel rendering: user-facing vs. internal (self-narration / reviewer loop). #
+#                                                                             #
+# A user-facing role may wrap internal self-narration in sentinel lines, each #
+# ALONE on its own line: `[[internal]]` opens a block, `[[/internal]]` closes  #
+# it. Everything outside such a block is user-facing. Reviewer/advisor         #
+# sessions render WHOLLY internal by construction (internal=True), so their    #
+# robustness never depends on the model emitting markers.                      #
+#                                                                             #
+# The same parser (`split_channel_segments`) backs both render paths — the     #
+# streaming claude path (StreamingMarkdown) and the one-shot codex path        #
+# (render_markdown) — so behavior is identical across controllers. On a TTY an #
+# internal segment is de-emphasized (Rich dim) under a small sub-label; off a  #
+# TTY only the marker lines are stripped and the enclosed text is emitted      #
+# plain, so marker-FREE content is byte-identical to the historical output.    #
+# --------------------------------------------------------------------------- #
+
+INTERNAL_OPEN = "[[internal]]"
+INTERNAL_CLOSE = "[[/internal]]"
+# Shown dim ahead of an internal block on a TTY so the user can tell internal
+# self/peer chatter from content addressed to them.
+INTERNAL_SUBLABEL = "· internal"
+
+
+def split_channel_segments(text, internal_start=False):
+    """Split `text` into ordered (channel, segment_text) runs, channel in
+    {'user','internal'}, and return (segments, internal_end).
+
+    A control line is recognized ONLY when a full line's stripped content equals
+    exactly `[[internal]]` or `[[/internal]]`; text that merely contains the
+    literal mid-line renders verbatim. Channel state is a BOOLEAN (depth-1): a
+    second open while already internal, or a close with no open, is a no-op.
+    Marker lines are always stripped. `internal_start` seeds the state so a
+    block can span multiple calls (the streaming commit cursor); `internal_end`
+    reports the state after this text so the caller can carry it forward.
+
+    For marker-FREE text the single returned segment's text is byte-identical to
+    the input (``"".join(seg for _c, seg in segments) == text``)."""
+    segments = []
+    internal = bool(internal_start)
+    channel = "internal" if internal else "user"
+    buf = []
+
+    def flush():
+        if buf:
+            segments.append((channel, "".join(buf)))
+            buf.clear()
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == INTERNAL_OPEN:
+            if not internal:
+                flush()
+                internal = True
+                channel = "internal"
+            continue  # marker line is channel control, never displayed
+        if stripped == INTERNAL_CLOSE:
+            if internal:
+                flush()
+                internal = False
+                channel = "user"
+            continue
+        buf.append(line)
+    flush()
+    return segments, internal
+
+
+def _hold_marker_prefix(text):
+    """Split off a trailing partial line (no terminating newline) that COULD be
+    the start of a control marker, so the live TTY tail never flashes a partial
+    sentinel like `[[intern` before the line completes. Returns the text safe to
+    render now; the held remainder stays in the region buffer and renders once
+    the line completes (or, at end of turn, as ordinary content — an incomplete
+    sentinel is never a marker). Complete marker lines are handled by the parser;
+    this only guards the still-growing last line."""
+    nl = text.rfind("\n")
+    last = text[nl + 1:]
+    stripped = last.strip()
+    if stripped and (INTERNAL_OPEN.startswith(stripped)
+                     or INTERNAL_CLOSE.startswith(stripped)):
+        return text[:nl + 1]  # hold the ambiguous trailing line
+    return text
+
+
+def _segment_renderables(text, internal_start=False, whole_internal=False):
+    """Build the Rich renderables for `text`'s channel segments (TTY only), and
+    return (renderables, internal_end). A 'user' segment renders as Markdown; an
+    'internal' segment renders as a dim sub-label followed by dim Markdown.
+    `whole_internal` treats the entire text as one internal segment (the
+    reviewer/advisor channel), bypassing marker parsing."""
+    from rich.markdown import Markdown
+    from rich.styled import Styled
+    from rich.text import Text
+    if whole_internal:
+        # Strip control lines even for a wholly-internal region (the contract:
+        # marker lines are NEVER emitted literally), then render every remaining
+        # line on the internal channel regardless of any stray markers within.
+        stripped, _end = split_channel_segments(text)
+        segments = [("internal", "".join(s for _channel, s in stripped))]
+        internal_end = True
+    else:
+        segments, internal_end = split_channel_segments(text, internal_start)
+    renderables = []
+    for channel, seg in segments:
+        body = seg.strip("\n")
+        if not body:
+            continue
+        if channel == "internal":
+            renderables.append(Text(INTERNAL_SUBLABEL, style="dim"))
+            renderables.append(Styled(Markdown(body), "dim"))
+        else:
+            renderables.append(Markdown(body))
+    return renderables, internal_end
+
+
+def render_markdown(io_out, text, enabled=None, internal=False):
     """Render markdown on a TTY (Rich); write the raw text otherwise. Used for
-    whole, non-streamed replies (codex) and any one-shot markdown."""
+    whole, non-streamed replies (codex) and any one-shot markdown.
+
+    Channel-aware: inline `[[internal]]` blocks render dim with a sub-label, and
+    `internal=True` renders the WHOLE text on the internal channel (the codex
+    reviewer/advisor path). Off a TTY only the marker lines are stripped — for
+    marker-free content the output is byte-identical to the historical raw
+    write."""
     enabled = is_tty(io_out) if enabled is None else enabled
     if not enabled:
-        io_out.write(text + ("\n" if not text.endswith("\n") else ""))
+        # Off a TTY there is no styling, so the internal flag only governs which
+        # lines are stripped: marker lines go, enclosed text stays plain.
+        segments, _ = split_channel_segments(text)
+        plain = "".join(seg for _channel, seg in segments)
+        io_out.write(plain + ("\n" if not plain.endswith("\n") else ""))
         io_out.flush()
         return
-    from rich.markdown import Markdown
-    _rich_console(io_out).print(Markdown(text))
+    console = _rich_console(io_out)
+    renderables, _ = _segment_renderables(text, whole_internal=internal)
+    for renderable in renderables:
+        console.print(renderable)
 
 
 def _safe_commit_point(text, start):
@@ -212,12 +339,26 @@ class StreamingMarkdown:
     the historical raw stream, so the StringIO/mocked-subprocess tests are
     unchanged."""
 
-    def __init__(self, io_out, label_text, trace=None, trace_fields=None):
+    def __init__(self, io_out, label_text, trace=None, trace_fields=None,
+                 internal=False):
         self.io_out = io_out
         self.label_text = label_text
         self.trace = trace
         self.trace_fields = trace_fields or {}
         self.tty = is_tty(io_out)
+        # internal=True renders the WHOLE region on the internal (dim) channel —
+        # the reviewer/advisor session. Otherwise inline `[[internal]]` blocks
+        # opt individual runs onto the internal channel.
+        self.internal = internal
+        # Channel state at the TTY commit cursor, carried across commits so a
+        # block that opens in one committed paragraph and closes in a later one
+        # stays dim throughout. _render() reads it without mutating it.
+        self._channel_internal = internal
+        # Non-TTY marker stripping is line-oriented: a marker is acted on only
+        # once a complete line is available, so a partial trailing line is held
+        # here until the next chunk (or the turn end) completes it.
+        self._nontty_pending = ""
+        self._nontty_internal = internal
         self.buf = []
         self._committed = 0  # chars of the buffer already printed permanently
         self._console = None
@@ -273,10 +414,14 @@ class StreamingMarkdown:
         point = _safe_commit_point(full, self._committed)
         if point is None:
             return
-        from rich.markdown import Markdown
-        chunk = full[self._committed:point].strip("\n")
-        if chunk:
-            self._console.print(Markdown(chunk))
+        raw = full[self._committed:point]
+        renderables, self._channel_internal = _segment_renderables(
+            raw, internal_start=self._channel_internal,
+            whole_internal=self.internal)
+        if renderables:
+            for renderable in renderables:
+                self._console.print(renderable)
+            chunk = raw.strip("\n")
             self._trace(
                 "ui.markdown.commit",
                 renderer="rich_live",
@@ -293,13 +438,26 @@ class StreamingMarkdown:
         is built fresh per render — Live's auto-refresh animates it against
         console time, and not storing it keeps the state surface minimal."""
         from rich.markdown import Markdown
-        md = Markdown(self._tail())
-        if self._status is None:
-            return md
+        # The tail is not yet committed, so render it from a COPY of the channel
+        # state (discard the returned end-state — only a commit advances it).
+        # Hold back a trailing partial line that could be a marker prefix, so a
+        # marker split across chunks never flashes half-matched in the live tail
+        # (the held text renders next frame once the line completes).
+        renderables, _ = _segment_renderables(
+            _hold_marker_prefix(self._tail()),
+            internal_start=self._channel_internal,
+            whole_internal=self.internal)
+        items = list(renderables)
+        if self._status is not None:
+            from rich.spinner import Spinner as RichSpinner
+            from rich.text import Text
+            items.append(RichSpinner("dots", text=Text(self._status, style="dim")))
+        if not items:
+            return Markdown("")
+        if len(items) == 1:
+            return items[0]
         from rich.console import Group
-        from rich.spinner import Spinner as RichSpinner
-        from rich.text import Text
-        return Group(md, RichSpinner("dots", text=Text(self._status, style="dim")))
+        return Group(*items)
 
     def set_status(self, text):
         """Show an activity row under the markdown (TTY only; no-op otherwise so
@@ -329,7 +487,32 @@ class StreamingMarkdown:
             if not self._started:
                 self.io_out.write("\n" + self.label_text)
                 self._started = True
-            self.io_out.write(chunk)
+            self._feed_nontty(chunk)
+
+    def _feed_nontty(self, chunk):
+        """Stream a chunk off a TTY, stripping whole marker lines as they
+        complete. A complete line ending in '\\n' is classified now; a partial
+        trailing line is held in self._nontty_pending until completed (markers
+        act on COMPLETE lines only). For marker-free content the emitted bytes
+        are identical to the historical raw passthrough."""
+        self._nontty_pending += chunk
+        out = []
+        while True:
+            nl = self._nontty_pending.find("\n")
+            if nl == -1:
+                break
+            line = self._nontty_pending[:nl + 1]
+            self._nontty_pending = self._nontty_pending[nl + 1:]
+            stripped = line.strip()
+            if stripped == INTERNAL_OPEN:
+                self._nontty_internal = True
+                continue  # marker line stripped from output
+            if stripped == INTERNAL_CLOSE:
+                self._nontty_internal = False
+                continue
+            out.append(line)
+        if out:
+            self.io_out.write("".join(out))
             self.io_out.flush()
 
     def __exit__(self, *exc):
@@ -338,14 +521,25 @@ class StreamingMarkdown:
             # Empty the Live region, tear it down, then print the remaining tail
             # permanently — once. Rendering the tail in the final Live frame AND
             # printing it would duplicate it; clearing first avoids that.
-            tail = self._tail().strip("\n")
+            tail = self._tail()
             self._committed = len("".join(self.buf))  # _tail() now empty
             self._live.update(self._render())
             self._live.__exit__(*exc)
-            if tail:
-                from rich.markdown import Markdown
-                self._console.print(Markdown(tail))
+            # Render the tail's segments — this force-closes any unclosed
+            # internal block (it just renders dim through end of turn); channel
+            # state never carries into the next turn (a fresh region per send).
+            renderables, self._channel_internal = _segment_renderables(
+                tail, internal_start=self._channel_internal,
+                whole_internal=self.internal)
+            for renderable in renderables:
+                self._console.print(renderable)
         else:
+            # Flush any held partial line. A trailing marker line (no newline)
+            # is force-closed: classified and stripped rather than leaked.
+            tail = self._nontty_pending
+            self._nontty_pending = ""
+            if tail.strip() not in (INTERNAL_OPEN, INTERNAL_CLOSE) and tail:
+                self.io_out.write(tail)
             self.io_out.write("\n")
         full = "".join(self.buf)
         self._trace(

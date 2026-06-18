@@ -134,8 +134,9 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
     (codex exec otherwise refuses with "Not inside a trusted directory").
     `extra_writable_dir`, when set, is granted as an additional writable root
     via `--add-dir` so a no-yolo (workspace-write) role can write its session
-    artifacts outside cwd. Granted on the fresh turn only — a codex resume
-    inherits this session's sandbox and cannot re-grant a root."""
+    artifacts outside cwd. The grant is re-applied on every codex resume too
+    (see `codex_resume_mode_args` / `build_codex_resume_command`), so resumed
+    roles keep the same effective permissions as this fresh turn."""
     return (
         ["codex", "exec", "--json", "--skip-git-repo-check"]
         + codex_mode_flags(mode, yolo)
@@ -144,17 +145,55 @@ def build_codex_command(prompt_text, mode, yolo, extra_writable_dir=None):
     )
 
 
-def build_codex_resume_command(thread_id, prompt_text):
+def codex_resume_mode_args(mode, yolo, extra_writable_dir=None):
+    """Resume-compatible permission args mirroring `codex_mode_flags` for a
+    `codex exec resume` turn (verified against codex-cli 0.139.0).
+
+    `codex exec resume` rejects `--sandbox`/`--add-dir`, but accepts
+    `--dangerously-bypass-approvals-and-sandbox` and `-c <dotted.toml.path>`.
+    So the sandboxed modes are re-applied through `-c` config keys instead:
+
+    - plan -> `sandbox_mode="read-only"` (mirrors fresh `--sandbox read-only`).
+    - implement + yolo -> `--dangerously-bypass-approvals-and-sandbox`.
+    - implement + no-yolo -> `sandbox_mode="workspace-write"`, plus, when
+      `extra_writable_dir` is set, `sandbox_workspace_write.writable_roots`
+      granting that dir (mirrors fresh `--sandbox workspace-write` + `--add-dir`;
+      the root is ADDED to the default roots, verified live).
+
+    The writable-root path is encoded as a TOML basic string via `json.dumps`
+    (a valid TOML basic string for filesystem paths, escaping any quotes/
+    backslashes); the array value is `[` + json.dumps(dir) + `]`.
+    """
+    if mode == "plan":
+        return ["-c", 'sandbox_mode="read-only"']
+    # implement
+    if yolo:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    args = ["-c", 'sandbox_mode="workspace-write"']
+    if extra_writable_dir:
+        roots = "[" + json.dumps(extra_writable_dir) + "]"
+        args += ["-c", "sandbox_workspace_write.writable_roots=" + roots]
+    return args
+
+
+def build_codex_resume_command(thread_id, prompt_text, mode, yolo,
+                               extra_writable_dir=None):
     """argv for a codex follow-up turn against an explicit thread id (never
     --last, which could grab a concurrent session in the same cwd).
 
-    `codex exec resume` takes only `--json`/`--skip-git-repo-check` before the
-    id; the sandbox policy is inherited from the original session (passing
-    `--sandbox` here errors on codex-cli 0.133.0)."""
-    return [
-        "codex", "exec", "resume", "--json", "--skip-git-repo-check",
-        thread_id, prompt_text,
-    ]
+    On codex-cli 0.139.0 `codex exec resume` does NOT inherit the original
+    session's sandbox, so each resume must re-apply the role's permissions.
+    `--sandbox`/`--add-dir` are rejected on resume, but
+    `--dangerously-bypass-approvals-and-sandbox` and `-c` config keys are
+    accepted — see `codex_resume_mode_args`, which mirrors the fresh-launch
+    permissions for every (mode, yolo) combo. The permission args go after
+    `--skip-git-repo-check` and before the thread id; prompt_text stays the
+    final positional arg (never --last)."""
+    return (
+        ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        + codex_resume_mode_args(mode, yolo, extra_writable_dir)
+        + [thread_id, prompt_text]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -404,10 +443,14 @@ class ClaudeSession:
 
     def __init__(self, role_prompt_file, mode, yolo, io_out=None, speaker="scout",
                  session_id=None, resume_id=None, on_session_id=None,
-                 region_factory=None, trace=None, extra_writable_dir=None):
+                 region_factory=None, trace=None, extra_writable_dir=None,
+                 internal=False):
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
+        # internal=True streams this whole session on the dim internal channel
+        # (reviewer/advisor); role sessions stay False and mark inline blocks.
+        self.internal = internal
         self.on_session_id = on_session_id
         self.trace = trace
         self.mode = mode
@@ -500,7 +543,7 @@ class ClaudeSession:
                         trace_fields={
                             "controller": "claude",
                             "role": self.speaker,
-                        })
+                        }, internal=self.internal)
                 else:
                     region = self._region_factory(self.io_out, label)
                 region.__enter__()
@@ -605,17 +648,21 @@ class CodexSession:
 
     def __init__(self, mode, yolo, io_out=None, speaker="scout",
                  resume_thread_id=None, on_thread_id=None, trace=None,
-                 extra_writable_dir=None):
+                 extra_writable_dir=None, internal=False):
         self.mode = mode
         self.yolo = yolo
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
+        # internal=True renders this whole session's turns on the dim internal
+        # channel (reviewer/advisor); role sessions stay False and mark inline.
+        self.internal = internal
         self.thread_id = resume_thread_id
         self.on_thread_id = on_thread_id
         self.trace = trace
-        # Granted as a writable root on the FRESH exec turn only; a codex resume
-        # inherits this session's sandbox and cannot re-grant a root.
+        # Granted as a writable root on the fresh exec turn AND re-granted on
+        # every resume (via -c sandbox_workspace_write.writable_roots), so a
+        # resumed no-yolo role keeps writing its session assets outside cwd.
         self.extra_writable_dir = extra_writable_dir
         self._notified = False
         self._resuming_first = resume_thread_id is not None
@@ -648,7 +695,8 @@ class CodexSession:
                             self.io_out.write(ui.label(self.speaker, tty))
                             wrote_label["done"] = True
                         if render:
-                            ui.render_markdown(self.io_out, text, enabled=tty)
+                            ui.render_markdown(self.io_out, text, enabled=tty,
+                                               internal=self.internal)
                         else:
                             self.io_out.write(text + "\n")
                         self.io_out.flush()
@@ -687,7 +735,9 @@ class CodexSession:
                                      role=self.speaker, result="error",
                                      error_type="missing_thread_id")
                 return
-            command = build_codex_resume_command(self.thread_id, text)
+            command = build_codex_resume_command(
+                self.thread_id, text, self.mode, self.yolo,
+                extra_writable_dir=self.extra_writable_dir)
             fresh = False
         self._started = True
         if self.trace:
