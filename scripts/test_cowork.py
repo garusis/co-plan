@@ -946,8 +946,11 @@ class MultiSessionFlowTest(unittest.TestCase):
             fake_scout.last_resume = resume_id
             fake_scout.last_intel = intel_path
             if on_session and resume_id is None:
+                # The uuid now lives in the per-session FOLDER, not the intel
+                # filename — derive the fake per-session id from the folder so it
+                # stays unique across sessions.
                 on_session("claude", "sess-" + os.path.basename(
-                    intel_path or "x"))
+                    os.path.dirname(intel_path or "x")))
             return 0
         fake_scout.last_resume = "unset"
         fake_scout.last_intel = None
@@ -1193,10 +1196,12 @@ class SessionFlowTest(unittest.TestCase):
         self.assertTrue(state_store.has_config(saved))
         self.assertEqual(state_store.get_role_session(saved, "scout", "claude"),
                          "sess-abc")
-        # a cowork session uuid is minted, persisted, and names the intel file
+        # a cowork session uuid is minted and persisted; it isolates the intel
+        # file via the per-session FOLDER, while the filename itself is uuid-free.
         suid = state_store.get_session_uuid(saved)
         self.assertTrue(suid)
-        self.assertIn("scout.intel.%s.json" % suid, fake_scout.last_intel)
+        self.assertIn("scout.intel.json", fake_scout.last_intel)
+        self.assertIn(suid, fake_scout.last_intel)  # uuid in the folder, not name
 
         # Run 2: only context + session file -> config reused, session resumed.
         out = io.StringIO()
@@ -1409,9 +1414,11 @@ class FallthroughTest(unittest.TestCase):
         self.assertIn("JSON", brief)
 
     def test_scout_intel_path(self):
+        # No-uuid filename: the per-session folder isolates it; the session_uuid
+        # arg is kept for call-site stability but unused.
         self.assertEqual(
             cowork.scout_intel_path(".cowork", "abc-123"),
-            ".cowork/scout.intel.abc-123.json")
+            ".cowork/scout.intel.json")
 
     def test_codex_prompt_includes_all_parts(self):
         prompt = cowork.assemble_codex_prompt("ROLE", "TEAM", "CTX")
@@ -1932,9 +1939,11 @@ class ReadReviewTest(unittest.TestCase):
         self.assertIsNone(state_store.read_review(path))
 
     def test_review_path_for(self):
+        # The uuid lives in the per-session folder, not the filename; the
+        # session_uuid param is kept for call-site stability but unused.
         self.assertEqual(
             state_store.review_path_for(".cowork", "abc-123"),
-            ".cowork/scout-review.abc-123.json")
+            ".cowork/scout-review.json")
 
 
 class ReviewerContextTest(unittest.TestCase):
@@ -2109,11 +2118,13 @@ class ScoutLoopReviewTest(unittest.TestCase):
         self.assertIn("per-device or per-account?", sess.sent[1])
         self.assertIn("needs_input", sess.sent[1])
 
-    def test_missing_review_is_safe_revise_not_approve(self):
-        # review_fn returns None (missing/unreadable review file) -> must be
-        # treated as revise, never a silent fall-through to approval.
+    def test_missing_review_surfaces_failure_gate_not_silent_approve(self):
+        # review_fn returns None (missing/unreadable verdict) every time: a
+        # no-usable-verdict failure. After REVIEW_FAIL_CAP consecutive failures
+        # the user sees the retry/skip-review/end gate — never a silent approval
+        # and never an endless bounce through the role.
         intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
+        sess = self._session(intel, ["ready_for_review"])
         calls = {"n": 0}
 
         def review_fn(intel_path, round_index):
@@ -2122,38 +2133,46 @@ class ScoutLoopReviewTest(unittest.TestCase):
 
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
-                                io_in=io.StringIO(""), io_out=out,
+                                io_in=io.StringIO("end\n"), io_out=out,
                                 review_fn=review_fn)
         self.assertEqual(rc, 0)
-        # round 1 None -> revise handoff injected (not the user gate)
-        self.assertIn("[reviewer handoff]", sess.sent[1])
-        # cap reached -> user gate with a generic non-approval dissent
-        self.assertEqual(calls["n"], cowork.REVIEW_ROUND_CAP)
-        self.assertIn("reviewer did not approve", out.getvalue())
+        # one silent auto-retry, then the gate: review_fn ran exactly FAIL_CAP times
+        self.assertEqual(calls["n"], cowork.REVIEW_FAIL_CAP)
+        self.assertIn("could not return a usable verdict", out.getvalue())
+        # the role was never bounced — only the seed was ever sent
+        self.assertEqual(sess.sent, ["seed"])
 
-    def test_unknown_verdict_is_safe_revise(self):
+    def test_unknown_verdict_single_then_recovers_no_gate(self):
+        # A single bad verdict (unknown value) is tolerated by ONE silent
+        # auto-retry; the reviewer recovers on the retry, so no gate is shown and
+        # the role is never bounced.
         intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
+        sess = self._session(intel, ["ready_for_review"])
         rfn = self._review_fn([{"verdict": "lgtm"}, {"verdict": "approve"}])
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
                                 io_in=io.StringIO(""), io_out=out, review_fn=rfn)
         self.assertEqual(rc, 0)
-        # unknown verdict did NOT approve on round 1; it injected a revise handoff
-        self.assertIn("[reviewer handoff]", sess.sent[1])
+        self.assertEqual(rfn.calls["n"], 2)          # bad verdict + silent retry
+        self.assertNotIn("could not return a usable verdict", out.getvalue())
+        self.assertNotIn("[reviewer handoff]", "".join(sess.sent))  # no bounce
+        self.assertIn("scout finished", out.getvalue())             # approved
 
-    def test_needs_user_without_question_does_not_relay_empty(self):
+    def test_needs_user_without_question_is_failure_not_empty_relay(self):
+        # needs_user with a blank question can't be relayed faithfully -> a
+        # failure, NOT an empty needs_user relay. One silent retry recovers here.
         intel = self._intel()
-        sess = self._session(intel, ["ready_for_review", "ready_for_review"])
-        # needs_user but empty question -> safe revise, never an empty relay
+        sess = self._session(intel, ["ready_for_review"])
         rfn = self._review_fn([{"verdict": "needs_user", "user_question": ""},
                                {"verdict": "approve"}])
         out = io.StringIO()
         rc = cowork._scout_loop(sess, "seed", intel, context="",
                                 io_in=io.StringIO(""), io_out=out, review_fn=rfn)
         self.assertEqual(rc, 0)
-        self.assertIn("[reviewer handoff]", sess.sent[1])
-        self.assertNotIn("Question:", sess.sent[1])   # not a needs_user relay
+        self.assertEqual(rfn.calls["n"], 2)
+        joined = "".join(sess.sent)
+        self.assertNotIn("Question:", joined)        # never an empty relay
+        self.assertNotIn("[reviewer handoff]", joined)  # recovered -> no bounce
 
     def test_no_review_fn_keeps_legacy_user_gate(self):
         intel = self._intel()
@@ -3755,15 +3774,17 @@ class PhaseStateTest(unittest.TestCase):
         self.assertEqual(loaded["team"], ["scout", "planner"])  # preserved
 
     def test_planner_path_helpers(self):
+        # No-uuid filenames: the per-session folder already isolates them; the
+        # session_uuid arg is kept for call-site stability but unused.
         self.assertEqual(
             state_store.planner_plan_json_path_for(".cowork", "abc"),
-            ".cowork/planner.plan.abc.json")
+            ".cowork/planner.plan.json")
         self.assertEqual(
             state_store.planner_plan_md_path_for(".cowork", "abc"),
-            ".cowork/planner.plan.abc.md")
+            ".cowork/planner.plan.md")
         self.assertEqual(
             state_store.planner_review_path_for(".cowork", "abc"),
-            ".cowork/planner-review.abc.json")
+            ".cowork/planner-review.json")
 
     def test_read_handoff(self):
         path = self._tmp()  # reuse tmp dir; file path below
@@ -4078,7 +4099,7 @@ class PhaseChainFlowTest(unittest.TestCase):
         # Produced artifacts now live under the session-assets home, not the
         # project-local .cowork dir (which keeps only session.json).
         intel = os.path.join(state_store.session_assets_dir(suid),
-                             "scout.intel.%s.json" % suid)
+                             "scout.intel.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review",
@@ -4093,7 +4114,7 @@ class PhaseChainFlowTest(unittest.TestCase):
         # Pre-create the session so the intel file exists when the seed is built.
         state_store.ensure_session(spath, None, "S")
         intel = os.path.join(state_store.session_assets_dir("S"),
-                             "scout.intel.S.json")
+                             "scout.intel.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review",
@@ -4112,10 +4133,11 @@ class PhaseChainFlowTest(unittest.TestCase):
         self.assertIn("APPROVED", seed)
         self.assertIn('"finding": "F1"', seed)
         self.assertIn("build the thing", seed)
-        # planner artifacts named by the session uuid
-        self.assertIn("planner.plan.S.json", calls["planner"][0]["plan_json_path"])
-        self.assertIn("planner.plan.S.md", calls["planner"][0]["plan_md_path"])
-        self.assertIn("planner-review.S.json", calls["planner"][0]["review_path"])
+        # planner artifacts carry uuid-free names; the session FOLDER isolates them
+        self.assertIn("planner.plan.json", calls["planner"][0]["plan_json_path"])
+        self.assertIn("planner.plan.md", calls["planner"][0]["plan_md_path"])
+        self.assertIn("planner-review.json", calls["planner"][0]["review_path"])
+        self.assertIn("/S/", calls["planner"][0]["plan_json_path"])  # uuid folder
         # plan approval is terminal: the run ended with phase still `planning`
         saved = state_store.load(spath)
         self.assertEqual(state_store.get_phase(saved), "planning")
@@ -4182,7 +4204,7 @@ class PhaseChainFlowTest(unittest.TestCase):
         spath = self._tmp_session()
         state_store.ensure_session(spath, None, "S")
         intel = os.path.join(state_store.session_assets_dir("S"),
-                             "scout.intel.S.json")
+                             "scout.intel.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review", "result": {}}, fh)
@@ -4263,7 +4285,7 @@ class PhaseChainFlowTest(unittest.TestCase):
             [("handoff", "narrow scope to auth"), ("approved", None)])
         state_store.ensure_session(spath, None, "S")
         intel = os.path.join(state_store.session_assets_dir("S"),
-                             "scout.intel.S.json")
+                             "scout.intel.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review", "result": {}}, fh)
@@ -4388,7 +4410,7 @@ class PhaseChainFlowTest(unittest.TestCase):
             cowork.default_config(["scout", "planner"]), prior=state)
         state = state_store.save_phase(spath, "planning", prior=state)
         intel = os.path.join(state_store.session_assets_dir("S"),
-                             "scout.intel.S.json")
+                             "scout.intel.json")
         os.makedirs(os.path.dirname(intel), exist_ok=True)
         with open(intel, "w") as fh:
             json.dump({"status": "ready_for_review",
@@ -4480,9 +4502,11 @@ class _EvalEnvMixin:
 
 class EvalStateStoreTest(_EvalEnvMixin, unittest.TestCase):
     def test_eval_scratch_path_shape(self):
+        # `role` stays in the name (distinguishes the two evaluators); the
+        # session_uuid is dropped — the per-session folder carries it.
         self.assertEqual(
             state_store.eval_scratch_path_for("/tmp/.cowork", "scout", "S1"),
-            "/tmp/.cowork/eval.scout.S1.json")
+            "/tmp/.cowork/eval.scout.json")
 
     def test_scores_path_honors_env_root(self):
         root = self._scores_root()
@@ -5617,12 +5641,14 @@ class BuildingStateTest(unittest.TestCase):
                          "building")
 
     def test_build_path_helpers(self):
+        # No-uuid filenames: the per-session folder isolates them; the
+        # session_uuid arg is kept for call-site stability but unused.
         self.assertEqual(
             state_store.build_status_path_for(".cowork", "abc"),
-            ".cowork/builder.status.abc.json")
+            ".cowork/builder.status.json")
         self.assertEqual(
             state_store.build_review_path_for(".cowork", "abc"),
-            ".cowork/builder-review.abc.json")
+            ".cowork/builder-review.json")
 
     def test_building_epoch_persisted_and_bumped(self):
         path = self._tmp()
@@ -6115,12 +6141,12 @@ class BuildPhaseFlowTest(unittest.TestCase):
         # project-local .cowork dir (which keeps only session.json).
         base = state_store.session_assets_dir(suid)
         os.makedirs(base, exist_ok=True)
-        with open(os.path.join(base, "scout.intel.%s.json" % suid), "w") as fh:
+        with open(os.path.join(base, "scout.intel.json"), "w") as fh:
             json.dump({"status": "ready_for_review", "result": {}}, fh)
-        with open(os.path.join(base, "planner.plan.%s.json" % suid), "w") as fh:
+        with open(os.path.join(base, "planner.plan.json"), "w") as fh:
             json.dump({"status": "ready_for_review",
                        "result": {"step": "S1"}}, fh)
-        with open(os.path.join(base, "planner.plan.%s.md" % suid), "w") as fh:
+        with open(os.path.join(base, "planner.plan.md"), "w") as fh:
             fh.write("# PLAN MD")
 
     def test_plan_approval_chains_into_building(self):
@@ -6142,11 +6168,12 @@ class BuildPhaseFlowTest(unittest.TestCase):
         self.assertIn('"step": "S1"', seed)
         self.assertIn("# PLAN MD", seed)
         self.assertIn("do it", seed)
-        # builder artifacts named by the session uuid
-        self.assertIn("builder.status.S.json",
+        # builder artifacts carry uuid-free names; the session FOLDER isolates them
+        self.assertIn("builder.status.json",
                       calls["builder"][0]["build_status_path"])
-        self.assertIn("builder-review.S.json",
+        self.assertIn("builder-review.json",
                       calls["builder"][0]["build_review_path"])
+        self.assertIn("/S/", calls["builder"][0]["build_status_path"])  # uuid dir
         self.assertEqual(calls["builder"][0]["building_epoch"], 1)
         # build approval is terminal: phase persisted as building
         self.assertEqual(state_store.get_phase(state_store.load(spath)),
@@ -6857,6 +6884,417 @@ class MakeReviewFnSurfaceTest(unittest.TestCase):
             reviewer_runner=fake_runner, surface_io_out=surface)
         fn("/artifact", 1)
         self.assertIs(seen["kwargs"].get("surface_io_out"), surface)
+
+
+class NoUuidAssetNameTest(unittest.TestCase):
+    """Item 1: per-session asset filenames drop the uuid (the per-session folder
+    isolates them), while the project-local session.<uuid>.json keeps its uuid
+    and the picker still discovers sessions by it."""
+
+    def test_asset_builders_drop_uuid(self):
+        d = ".cowork"
+        self.assertEqual(state_store.review_path_for(d, "U"),
+                         ".cowork/scout-review.json")
+        self.assertEqual(state_store.planner_plan_json_path_for(d, "U"),
+                         ".cowork/planner.plan.json")
+        self.assertEqual(state_store.planner_plan_md_path_for(d, "U"),
+                         ".cowork/planner.plan.md")
+        self.assertEqual(state_store.planner_review_path_for(d, "U"),
+                         ".cowork/planner-review.json")
+        self.assertEqual(state_store.build_status_path_for(d, "U"),
+                         ".cowork/builder.status.json")
+        self.assertEqual(state_store.build_review_path_for(d, "U"),
+                         ".cowork/builder-review.json")
+        self.assertEqual(state_store.eval_scratch_path_for(d, "scout", "U"),
+                         ".cowork/eval.scout.json")
+        self.assertEqual(cowork.scout_intel_path(d, "U"), ".cowork/scout.intel.json")
+
+    def test_session_file_keeps_uuid_and_picker_discovers(self):
+        import tempfile
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(cwd, ignore_errors=True))
+        # new_session_path STILL carries the uuid (load-bearing picker anchor).
+        path = state_store.new_session_path(cwd, "abc-123")
+        self.assertTrue(path.endswith("session.abc-123.json"))
+        # and the picker still parses + discovers it by that uuid.
+        state_store.save(path, {"session_uuid": "abc-123",
+                                "context": "do the thing"})
+        rows = state_store.list_sessions(cwd)
+        self.assertEqual([r["id"] for r in rows], ["abc-123"])
+
+
+class PathDisplayTest(unittest.TestCase):
+    """Item 2a: home-rooted paths render as ~/… and, on a TTY, carry an OSC 8
+    hyperlink whose visible text is the short ~ form."""
+
+    def test_display_path_home_to_tilde(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(ui.display_path(os.path.join(home, ".cowork", "x")),
+                         os.path.join("~", ".cowork", "x"))
+        self.assertEqual(ui.display_path(home), "~")
+        self.assertEqual(ui.display_path("/tmp/elsewhere/x"), "/tmp/elsewhere/x")
+        self.assertEqual(ui.display_path(""), "")
+
+    def test_shorten_path_home_rooted_tilde(self):
+        home = os.path.expanduser("~")
+        p = os.path.join(home, ".cowork", "sessions", "S", "planner.plan.md")
+        # Outside cwd but under home -> ~ form, NOT '…/<basename>'.
+        self.assertEqual(ui.shorten_path(p, cwd="/some/other/dir"),
+                         os.path.join("~", ".cowork", "sessions", "S",
+                                      "planner.plan.md"))
+
+    def test_shorten_path_under_cwd_relative(self):
+        self.assertEqual(
+            ui.shorten_path("/tmp/work/.cowork/x.json", cwd="/tmp/work"),
+            ".cowork/x.json")
+
+    def test_shorten_path_outside_home_and_cwd_basename(self):
+        self.assertEqual(
+            ui.shorten_path("/var/data/x.json", cwd="/tmp/work"), "…/x.json")
+
+    def test_render_path_osc8_on_tty_plain_off(self):
+        home = os.path.expanduser("~")
+        p = os.path.join(home, ".cowork", "x")
+        tilde = os.path.join("~", ".cowork", "x")
+        # Off a TTY: just the short ~ form, no escape sequence.
+        self.assertEqual(ui.render_path(p, enabled=False), tilde)
+        # On a TTY: an OSC 8 hyperlink to file://<abs>, visible text = ~ form.
+        on = ui.render_path(p, enabled=True)
+        self.assertIn("\033]8;;file://" + os.path.abspath(p), on)
+        self.assertIn(tilde, on)
+        self.assertTrue(on.endswith("\033]8;;\033\\"))
+
+    def test_render_path_empty_passthrough(self):
+        self.assertEqual(ui.render_path("", enabled=True), "")
+
+    def test_raw_start_banner_renders_tilde(self):
+        home = os.path.expanduser("~")
+        p = os.path.join(home, ".cowork", "sessions", "S", "scout.intel.json")
+        tilde = os.path.join("~", ".cowork", "sessions", "S", "scout.intel.json")
+        off = cowork.scout_start_text(p, enabled=False)
+        self.assertIn(tilde, off)
+        self.assertNotIn(os.path.join(home, ".cowork"), off)  # not the long path
+        on = cowork.scout_start_text(p, enabled=True)
+        self.assertIn("\033]8;;file://", on)
+        self.assertIn(tilde, on)
+
+    def test_stuck_gate_raw_banner_renders_tilde(self):
+        home = os.path.expanduser("~")
+        p = os.path.join(home, ".cowork", "sessions", "S", "builder.status.json")
+        tilde = os.path.join("~", ".cowork", "sessions", "S", "builder.status.json")
+        txt = cowork._stuck_gate_text(p, "builder", enabled=False)
+        self.assertIn(tilde, txt)
+
+    def test_review_done_banners_render_tilde(self):
+        home = os.path.expanduser("~")
+        p = os.path.join(home, ".cowork", "sessions", "S", "planner.plan.md")
+        tilde = os.path.join("~", ".cowork", "sessions", "S", "planner.plan.md")
+        self.assertIn(tilde, cowork.planner_review_text(p, enabled=False))
+        self.assertIn(os.path.join("~", ".cowork", "b.json"),
+                      cowork.builder_done_text(
+                          os.path.join(home, ".cowork", "b.json"),
+                          enabled=False))
+
+
+class InternalLeadInTest(unittest.TestCase):
+    """Item 2b: a surfaced internal block gets a faint lead-in gap on a TTY, and
+    is a no-op (byte-identical) off a TTY — on BOTH controller render paths."""
+
+    def test_lead_in_tty_emits_gap(self):
+        out = FakeTTY()
+        ui.internal_lead_in(out, True)
+        v = out.getvalue()
+        self.assertTrue(v.startswith("\n"))
+        self.assertIn("─", v)
+
+    def test_lead_in_off_tty_noop(self):
+        out = io.StringIO()
+        ui.internal_lead_in(out)  # auto-detects: not a TTY
+        self.assertEqual(out.getvalue(), "")
+
+    def test_streaming_internal_nontty_byte_identical(self):
+        # The claude path off a TTY is unchanged (no gap) — historical contract.
+        out = io.StringIO()
+        with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
+            r.feed("verdict notes")
+        self.assertEqual(out.getvalue(), "\nrev › verdict notes\n")
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_streaming_internal_tty_has_lead_in(self):
+        import unittest.mock as mock
+        out = FakeTTY()
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            with ui.StreamingMarkdown(out, "rev › ", internal=True) as r:
+                r.feed("note\n")
+        text = out.getvalue()
+        self.assertIn("─", text)                       # lead-in rule present
+        self.assertLess(text.index("─"), text.index("rev"))  # above the label
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_streaming_user_tty_has_no_lead_in(self):
+        import unittest.mock as mock
+        out = FakeTTY()
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            with ui.StreamingMarkdown(out, "scout › ") as r:
+                r.feed("hi\n")
+        head = out.getvalue().split("scout")[0]
+        self.assertNotIn("─", head)                    # no gap for a user region
+
+    def _codex_proc(self, lines):
+        class FakeProc:
+            def __init__(self, lines):
+                self.stdout = iter(lines)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+        return FakeProc(lines)
+
+    class _FakeSpin:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def stop(self):
+            pass
+
+        def set_label(self, _t):
+            pass
+
+    def test_codex_internal_nontty_no_gap(self):
+        import unittest.mock as mock
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "T1"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "verdict"}}),
+        ]
+        out = io.StringIO()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=self._codex_proc(lines)), \
+                mock.patch.object(bridge, "_Spinner", self._FakeSpin):
+            s = bridge.CodexSession("implement", True, io_out=out,
+                                    speaker="rev", internal=True)
+            s.send("go")
+        # Off a TTY there is no lead-in rule; the label is written plainly.
+        self.assertNotIn("─", out.getvalue())
+        self.assertIn("rev › ", out.getvalue())
+
+    @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
+    def test_codex_internal_tty_has_lead_in(self):
+        import unittest.mock as mock
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "T1"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "verdict"}}),
+        ]
+        out = FakeTTY()
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=self._codex_proc(lines)), \
+                mock.patch.object(bridge, "_Spinner", self._FakeSpin), \
+                mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            s = bridge.CodexSession("implement", True, io_out=out,
+                                    speaker="rev", internal=True)
+            s.send("go")
+        text = out.getvalue()
+        self.assertIn("─", text)                       # lead-in rule present
+        self.assertLess(text.index("─"), text.index("rev"))  # above the label
+
+
+class IsReviewFailureTest(unittest.TestCase):
+    """Item 3: the failure predicate — no USABLE verdict, validated directly
+    against the verdict contract."""
+
+    def test_truth_table(self):
+        F = cowork._is_review_failure
+        # Failures: every no-usable-verdict mode.
+        self.assertTrue(F(None))
+        self.assertTrue(F({}))
+        self.assertTrue(F({"foo": 1}))                       # no 'verdict' key
+        self.assertTrue(F({"verdict": "maybe"}))             # unknown value
+        self.assertTrue(F({"verdict": "needs_user"}))        # no question
+        self.assertTrue(F({"verdict": "needs_user", "user_question": ""}))
+        self.assertTrue(F({"verdict": "needs_user", "user_question": "   "}))
+        self.assertTrue(F({"verdict": "revise", "malformed": True}))
+        # Non-failures: a usable verdict.
+        self.assertFalse(F({"verdict": "approve"}))
+        self.assertFalse(F({"verdict": "revise"}))
+        self.assertFalse(F({"verdict": "revise", "findings": ["x"]}))
+        self.assertFalse(F({"verdict": "needs_user", "user_question": "which?"}))
+
+
+class ReviewerFailureGateTest(unittest.TestCase):
+    """Item 3: a reviewer/advisor that returns no usable verdict twice running
+    surfaces the retry/skip-review/end gate (driven against the shared
+    _role_loop, so all three paired reviewers inherit the behavior)."""
+
+    def _path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "scout.intel.json")
+
+    def _trace(self, path):
+        return trace_store.Trace(
+            os.path.join(os.path.dirname(path), "trace.X.jsonl"),
+            session_uuid="X", run_id="R")
+
+    def _events(self, path):
+        tpath = os.path.join(os.path.dirname(path), "trace.X.jsonl")
+        with open(tpath, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _session(self, path, statuses):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                st = statuses.pop(0) if statuses else "ready_for_review"
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as fh:
+                    json.dump({"status": st}, fh)
+
+            def close(self):
+                self.closed = True
+        return FakeSession()
+
+    def _review_fn(self, verdicts):
+        calls = {"n": 0}
+
+        def review_fn(_p, _round):
+            calls["n"] += 1
+            return verdicts.pop(0) if verdicts else None
+        review_fn.calls = calls
+        return review_fn
+
+    def _run(self, path, statuses, review_fn, io_in, trace=None):
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            self._session(path, statuses), "seed", path, context="",
+            io_in=io.StringIO(io_in), io_out=out, review_fn=review_fn,
+            trace=trace)
+        return rc, outcome, out.getvalue()
+
+    def test_gate_fires_at_two_consecutive_failures_then_end(self):
+        path = self._path()
+        rfn = self._review_fn([])  # always None -> always a failure
+        trace = self._trace(path)
+        rc, outcome, out = self._run(
+            path, ["ready_for_review"], rfn, "end\n", trace=trace)
+        self.assertEqual((rc, outcome), (0, "ended"))
+        # one silent auto-retry then the gate: exactly FAIL_CAP reviewer calls.
+        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
+        self.assertIn("could not return a usable verdict", out)
+        ev = [e for e in self._events(path) if e["event"] == "review.failure"]
+        self.assertEqual([e["consecutive"] for e in ev], [1, 2])
+
+    def test_off_tty_default_is_skip_review(self):
+        # Blank input at the gate -> skip-review (never trap a scripted run);
+        # skip-review then reaches the user gate, which reads blank=approve.
+        path = self._path()
+        rfn = self._review_fn([])
+        rc, outcome, out = self._run(path, ["ready_for_review"], rfn, "")
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
+        self.assertIn("could not return a usable verdict", out)
+        self.assertIn("scout finished", out)
+
+    def test_retry_reruns_reviewer_counter_not_reset(self):
+        path = self._path()
+        rfn = self._review_fn([])  # never recovers
+        trace = self._trace(path)
+        # gate1 -> retry -> gate2 -> end. Retry does NOT consume the role; it
+        # re-runs the reviewer in place.
+        rc, outcome, out = self._run(
+            path, ["ready_for_review"], rfn, "retry\nend\n", trace=trace)
+        self.assertEqual((rc, outcome), (0, "ended"))
+        # silent retry (2 calls) + the gate retry (1 more) = 3 reviewer calls.
+        self.assertEqual(rfn.calls["n"], 3)
+        # gate shown twice; the role was never bounced (only the seed sent).
+        self.assertEqual(out.count("could not return a usable verdict"), 2)
+        actions = [e["action"] for e in self._events(path)
+                   if e["event"] == "user.action"]
+        self.assertIn("review_fail_retry", actions)
+        self.assertIn("review_fail_end", actions)
+
+    def test_skip_review_is_sticky_and_reaches_user_gate(self):
+        path = self._path()
+        rfn = self._review_fn([])  # would fail if ever called again
+        # gate -> skip -> user gate revises -> 2nd ready bypasses the reviewer
+        # entirely -> user approves.
+        rc, outcome, out = self._run(
+            path, ["ready_for_review", "ready_for_review"], rfn,
+            "skip\nchange this\n\n")
+        self.assertEqual((rc, outcome), (0, "approved"))
+        # reviewer ran only in round 1 (FAIL_CAP calls); round 2 bypassed it.
+        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
+        self.assertEqual(out.count("could not return a usable verdict"), 1)
+
+    def test_legit_revise_never_trips_the_gate(self):
+        path = self._path()
+        rfn = self._review_fn([
+            {"verdict": "revise", "findings": ["a"]},
+            {"verdict": "revise", "findings": ["b"]},
+            {"verdict": "approve"},
+        ])
+        rc, outcome, out = self._run(
+            path, ["ready_for_review"] * 3, rfn, "")
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertNotIn("could not return a usable verdict", out)
+        self.assertIn("reviewed: changes requested", out)
+
+    def test_usable_verdict_resets_failure_counter(self):
+        # A failure, then a usable revise (resets), then on the next round a
+        # single failure must NOT immediately trip the gate — proving the
+        # counter reset. Sequence: None, revise, None, approve.
+        path = self._path()
+        rfn = self._review_fn([
+            None, {"verdict": "revise", "findings": ["x"]},
+            None, {"verdict": "approve"},
+        ])
+        trace = self._trace(path)
+        rc, outcome, out = self._run(
+            path, ["ready_for_review"] * 2, rfn, "", trace=trace)
+        self.assertEqual((rc, outcome), (0, "approved"))
+        # The gate never fired: each round saw one failure (silent retry) then a
+        # usable verdict; the counter reset, so 2 never accrued.
+        self.assertNotIn("could not return a usable verdict", out)
+        fails = [e["consecutive"] for e in self._events(path)
+                 if e["event"] == "review.failure"]
+        self.assertEqual(fails, [1, 1])  # never reached 2
+
+    def test_tty_gate_select_skip_reaches_user_gate(self):
+        # The TTY path wires questionary select -> skip-review -> user gate.
+        import unittest.mock as mock
+        path = self._path()
+        rfn = self._review_fn([])
+        out = FakeTTY()
+
+        def fake_review(io_in, io_out, prompt=None):
+            return True  # confirm() at the user gate -> approve
+
+        with mock.patch.object(cowork.ui, "select", return_value="skip-review"), \
+                mock.patch.object(cowork.ui, "confirm", return_value=True):
+            rc, outcome, _ = cowork._role_loop(
+                self._session(path, ["ready_for_review"]), "seed", path,
+                context="", io_in=FakeTTY(), io_out=out, review_fn=rfn)
+        self.assertEqual((rc, outcome), (0, "approved"))
+        self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
 
 
 if __name__ == "__main__":
