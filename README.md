@@ -219,12 +219,12 @@ the directory you run it from (add `.cowork/` to your `.gitignore`). It stores:
 - a **cowork session UUID** (`session_uuid`) — minted once per session, distinct
   from any claude/codex session id. It names this session's assets, all of which
   live under `~/.cowork/sessions/<session_uuid>/`: the scout intel file
-  `scout.intel.<session_uuid>.json`, the review file
-  `scout-review.<session_uuid>.json`, the planner's plan files
-  `planner.plan.<session_uuid>.json` / `.md`, the planning-advisor's review file
-  `planner-review.<session_uuid>.json`, the builder's status file
-  `builder.status.<session_uuid>.json`, the build-reviewer's review file
-  `builder-review.<session_uuid>.json`, the aggregate peer-eval `scores.json`,
+  `scout.intel.json`, the review file
+  `scout-review.json`, the planner's plan files
+  `planner.plan.json` / `.md`, the planning-advisor's review file
+  `planner-review.json`, the builder's status file
+  `builder.status.json`, the build-reviewer's review file
+  `builder-review.json`, the aggregate peer-eval `scores.json`,
   and the private orchestration trace `trace.jsonl`;
 - the **team** and **per-role config** — so the next run in the same directory
   does not re-ask them (you'll see `using saved session config`);
@@ -301,7 +301,7 @@ find the right thing to build, the way a good product conversation goes:
 5. **Hand off** — writes its intel and marks it ready for review.
 
 Its **only write target** is its intel file
-`~/.cowork/sessions/<session_uuid>/scout.intel.<session_uuid>.json`; it must not touch any other file
+`~/.cowork/sessions/<session_uuid>/scout.intel.json`; it must not touch any other file
 (reading/searching the whole repo is encouraged). Full spec:
 [roles/scout.md](roles/scout.md).
 
@@ -334,7 +334,7 @@ whether blocking product questions were buried as assumptions, whether cited
 discoveries hold up, and completeness — it is instructed to find gaps, not to
 rubber-stamp.
 
-It writes a verdict to its own file, `~/.cowork/sessions/<session_uuid>/scout-review.<session_uuid>.json`
+It writes a verdict to its own file, `~/.cowork/sessions/<session_uuid>/scout-review.json`
 (its **only** write target, cleared before each pass so a stale verdict is never
 read back):
 
@@ -372,14 +372,14 @@ plan ready when it is decision-complete.
 
 The planner produces **two artifacts** (its only write targets):
 
-- `~/.cowork/sessions/<session_uuid>/planner.plan.<session_uuid>.json` — the **machine deliverable** and
+- `~/.cowork/sessions/<session_uuid>/planner.plan.json` — the **machine deliverable** and
   source of truth for downstream roles, carrying the dense engineering detail:
   goal-coverage mapping, decisions with rationale, file/symbol-cited evidence,
   per-file change lists, and the test inventory. Its top level mirrors the
   scout intel (`{session, role, status, handoff?, result}`) and doubles as the
   planner's status channel
   (`needs_input | ready_for_review | handoff_back`).
-- `~/.cowork/sessions/<session_uuid>/planner.plan.<session_uuid>.md` — the **human-first plan** you review
+- `~/.cowork/sessions/<session_uuid>/planner.plan.md` — the **human-first plan** you review
   at the plan gate: TL;DR; What we're building; Key decisions; How it will
   work; What changes; How we'll know it works; Out of scope; Risks &
   assumptions. Sections stay small and scannable; when you want deeper detail,
@@ -404,7 +404,7 @@ showing you the gate. Same verdict semantics — `approve` proceeds to your gate
 shown with the advisor's unresolved notes attached; never a hard block),
 `needs_user` questions reach you only through the planner's faithful relay, and
 a missing/malformed verdict counts as `revise`. Its only write target is
-`~/.cowork/sessions/<session_uuid>/planner-review.<session_uuid>.json`, cleared before each pass. Full
+`~/.cowork/sessions/<session_uuid>/planner-review.json`, cleared before each pass. Full
 spec: [roles/planning-advisor.md](roles/planning-advisor.md).
 
 ## The builder role
@@ -414,7 +414,7 @@ into the **building phase**. The builder is seeded with the approved plan (JSON
 + markdown) plus the current shared context, and becomes the single voice you
 talk to. Unlike the scout and planner, its write target is the **whole
 repository** — it executes the plan by editing source files. Its
-`~/.cowork/sessions/<session_uuid>/builder.status.<session_uuid>.json` is only a status + verification
+`~/.cowork/sessions/<session_uuid>/builder.status.json` is only a status + verification
 channel (`needs_input | ready_for_review | handoff_back`, plus a
 `result.verification` log), not a write restriction.
 
@@ -447,7 +447,7 @@ Same verdict semantics — `approve` proceeds to your gate,
 shows the unresolved notes; never a hard block), `needs_user` reaches you only
 through the builder's faithful relay, and a missing/malformed verdict counts as
 `revise`. Its only write target is
-`~/.cowork/sessions/<session_uuid>/builder-review.<session_uuid>.json`, cleared before each pass; it never
+`~/.cowork/sessions/<session_uuid>/builder-review.json`, cleared before each pass; it never
 edits code — fixes go through the builder. Full spec:
 [roles/build-reviewer.md](roles/build-reviewer.md).
 

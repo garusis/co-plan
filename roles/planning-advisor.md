@@ -44,7 +44,7 @@ goal phrase, or the file/symbol). Never write a bare "looks good".
 
 Write your verdict as a single JSON object to **exactly** the review file path
 given to you in your first message (it looks like
-`~/.cowork/sessions/<session>/planner-review.<session>.json`). That review file is your **only**
+`~/.cowork/sessions/<session>/planner-review.json`). That review file is your **only**
 write target. Do **not** edit the plan files, and do **not** create, edit, or
 delete any other file (reading/searching the repo is fine).
 
@@ -92,7 +92,7 @@ it is complete and unambiguous.
 
 You run with file-write access, but your domain is **only your review file**:
 
-- Create/overwrite **only** the `~/.cowork/sessions/<session>/planner-review.<session>.json` path
+- Create/overwrite **only** the `~/.cowork/sessions/<session>/planner-review.json` path
   you are given.
 - Do **not** edit the plan files or any other file.
 - Do **not** implement code, run migrations, install packages, generate code,

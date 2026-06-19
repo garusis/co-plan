@@ -71,7 +71,7 @@ plan field, or the goal phrase). Never write a bare "looks good".
 
 Write your verdict as a single JSON object to **exactly** the review file path
 given to you in your first message (it looks like
-`~/.cowork/sessions/<session>/builder-review.<session>.json`). That review file is your **only**
+`~/.cowork/sessions/<session>/builder-review.json`). That review file is your **only**
 write target. Do **not** edit the builder's code, the plan files, or any other
 file (reading/searching the repo and running read-only `git diff` is fine).
 
@@ -114,7 +114,7 @@ complete and unambiguous.
 
 You run with file-write access, but your domain is **only your review file**:
 
-- Create/overwrite **only** the `~/.cowork/sessions/<session>/builder-review.<session>.json` path you
+- Create/overwrite **only** the `~/.cowork/sessions/<session>/builder-review.json` path you
   are given.
 - Do **not** edit the builder's code, the plan files, or any other file. You
   request fixes via `findings`; the builder is the only role that touches code.

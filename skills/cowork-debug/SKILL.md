@@ -15,8 +15,8 @@ Reconstruct what happened in a cowork run by joining four evidence sources:
    session UUID, team/config, role controller IDs, and context revisions.
 2. `~/.cowork/sessions/<session_uuid>/trace.jsonl` for cowork orchestration
    decisions.
-3. `~/.cowork/sessions/<session_uuid>/scout.intel.<session_uuid>.json` and
-   `~/.cowork/sessions/<session_uuid>/scout-review.<session_uuid>.json` for
+3. `~/.cowork/sessions/<session_uuid>/scout.intel.json` and
+   `~/.cowork/sessions/<session_uuid>/scout-review.json` for
    current/final artifacts.
 4. Claude/Codex local logs for role conversation and tool history.
 
@@ -32,8 +32,8 @@ against trace events, artifacts, and controller logs.
    - Record `sessions.<role>.controller`, `sessions.<role>.id`, team/config,
      context revision, and `last_context_revision_seen`.
 2. Read current artifacts (under `~/.cowork/sessions/<uuid>/`):
-   - Intel: `~/.cowork/sessions/<uuid>/scout.intel.<uuid>.json`
-   - Review: `~/.cowork/sessions/<uuid>/scout-review.<uuid>.json`
+   - Intel: `~/.cowork/sessions/<uuid>/scout.intel.json`
+   - Review: `~/.cowork/sessions/<uuid>/scout-review.json`
    - Trace: `~/.cowork/sessions/<uuid>/trace.jsonl`
 3. Locate controller logs:
    - Claude session id: `~/.claude/projects/**/<session_id>.jsonl`
