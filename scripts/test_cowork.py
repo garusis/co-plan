@@ -7297,5 +7297,663 @@ class ReviewerFailureGateTest(unittest.TestCase):
         self.assertEqual(rfn.calls["n"], cowork.REVIEW_FAIL_CAP)
 
 
+class ScoutIntelMdHelperTest(unittest.TestCase):
+    """scout.intel.md path helper + the scout-side md plumbing (brief, reviewer
+    brief/context/resume, gate text surfaces)."""
+
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def test_scout_intel_md_path_helper(self):
+        self.assertEqual(
+            state_store.scout_intel_md_path_for(".cowork", "abc-123"),
+            ".cowork/scout.intel.md")
+
+    def test_scout_brief_declares_both_write_targets(self):
+        brief = cowork.assemble_scout_brief(
+            ["scout", "scout-reviewer"],
+            "/s/scout.intel.json", "/s/scout.intel.md")
+        self.assertIn("/s/scout.intel.json", brief)
+        self.assertIn("/s/scout.intel.md", brief)
+        self.assertIn("ONLY write target", brief)
+        # both files, not a single one
+        self.assertIn("two intel files", brief)
+        self.assertIn("CONSISTENT", brief)
+
+    def test_scout_brief_single_target_when_no_md(self):
+        # back-compat: no md path -> the original single-target instruction
+        brief = cowork.assemble_scout_brief(["scout"], "/s/scout.intel.json")
+        self.assertIn("/s/scout.intel.json", brief)
+        self.assertIn("ONLY write target", brief)
+        self.assertNotIn("two intel files", brief)
+
+    def test_reviewer_brief_protects_both_scout_files(self):
+        brief = cowork.assemble_reviewer_brief(".cowork/scout-review.json")
+        # the widened default names both files; the old substring still holds
+        self.assertIn("Do NOT edit the scout intel", brief)
+        self.assertIn("markdown", brief)
+
+    def test_reviewer_context_embeds_both_intel_files(self):
+        d = self._tmp()
+        intel = os.path.join(d, "scout.intel.json")
+        intel_md = os.path.join(d, "scout.intel.md")
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review",
+                       "result": {"objective": "JSON-OBJECTIVE"}}, fh)
+        with open(intel_md, "w") as fh:
+            fh.write("# MD-RENDERING")
+        ctx = cowork.assemble_reviewer_context(
+            "the goal", ["scout", "scout-reviewer"], intel, intel_md)
+        self.assertIn("JSON-OBJECTIVE", ctx)   # JSON embedded
+        self.assertIn("MD-RENDERING", ctx)      # markdown embedded
+        self.assertIn("CONSISTENT", ctx)        # the consistency instruction
+        # without the md path, only the JSON is embedded (back-compat)
+        ctx_json_only = cowork.assemble_reviewer_context(
+            "the goal", ["scout"], intel)
+        self.assertIn("JSON-OBJECTIVE", ctx_json_only)
+        self.assertNotIn("MD-RENDERING", ctx_json_only)
+
+    def test_reviewer_resume_context_embeds_both_intel_files(self):
+        d = self._tmp()
+        intel = os.path.join(d, "scout.intel.json")
+        intel_md = os.path.join(d, "scout.intel.md")
+        with open(intel, "w") as fh:
+            json.dump({"status": "ready_for_review"}, fh)
+        with open(intel_md, "w") as fh:
+            fh.write("MD-RESUME-BODY")
+        resumed = cowork.assemble_reviewer_resume_context(
+            intel, intel_md, context_update="redirected goal")
+        self.assertIn("<context>\nredirected goal\n</context>", resumed)
+        self.assertIn("ready_for_review", resumed)   # JSON
+        self.assertIn("MD-RESUME-BODY", resumed)      # markdown
+        # back-compat: positional intel only still works (no md), no block
+        plain = cowork.assemble_reviewer_resume_context(intel)
+        self.assertIn("ready_for_review", plain)
+        self.assertNotIn("MD-RESUME-BODY", plain)
+        self.assertNotIn("<context>", plain)
+
+    def test_scout_gate_text_points_at_md_when_wired(self):
+        # _scout_loop repoints the review/done surfaces at the intel markdown.
+        d = self._tmp()
+        intel = os.path.join(d, "scout.intel.json")
+        intel_md = os.path.join(d, "scout.intel.md")
+
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                with open(intel, "w") as fh:
+                    json.dump({"status": "ready_for_review"}, fh)
+
+            def close(self):
+                self.closed = True
+
+        out = io.StringIO()
+        rc = cowork._scout_loop(
+            FakeSession(), "seed", intel, context="",
+            io_in=io.StringIO(""), io_out=out, intel_md_path=intel_md)
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("ready for review", text)
+        self.assertIn("scout.intel.md", text)     # surfaces the markdown path
+        self.assertIn("scout finished", text)
+
+
+class BuilderSummaryMdHelperTest(unittest.TestCase):
+    """builder.summary.md path helper + the builder-side md plumbing (brief,
+    build-reviewer context/resume, gate text surfaces)."""
+
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def test_build_summary_path_helper(self):
+        self.assertEqual(
+            state_store.build_summary_path_for(".cowork", "abc"),
+            ".cowork/builder.summary.md")
+
+    def test_builder_brief_declares_summary_target(self):
+        brief = cowork.assemble_builder_brief(
+            ".cowork/builder.status.json", ".cowork/builder.summary.md")
+        self.assertIn(".cowork/builder.status.json", brief)
+        self.assertIn(".cowork/builder.summary.md", brief)
+        self.assertIn("self-audit", brief)
+        self.assertIn("CONSISTENT", brief)
+        # still not a write restriction (whole repo is the write target)
+        self.assertIn("NOT a restriction", brief)
+
+    def test_builder_brief_no_summary_when_not_wired(self):
+        brief = cowork.assemble_builder_brief(".cowork/builder.status.json")
+        self.assertIn(".cowork/builder.status.json", brief)
+        self.assertNotIn("builder.summary.md", brief)
+
+    def test_build_reviewer_context_embeds_summary(self):
+        d = self._tmp()
+        pj = os.path.join(d, "plan.json")
+        pm = os.path.join(d, "plan.md")
+        status = os.path.join(d, "builder.status.json")
+        summary = os.path.join(d, "builder.summary.md")
+        for p, body in ((pj, '{"plan": "J"}'), (pm, "# MD PLAN"),
+                        (status, '{"status": "ready_for_review"}'),
+                        (summary, "# SUMMARY-BODY")):
+            with open(p, "w") as fh:
+                fh.write(body)
+        ctx = cowork.assemble_build_reviewer_context(
+            "goal", ["builder"], pj, pm, status, build_summary_path=summary)
+        self.assertIn("SUMMARY-BODY", ctx)
+        self.assertIn("consistency-check", ctx)
+        # still embeds the rest + the diff recipe
+        self.assertIn('"plan": "J"', ctx)
+        self.assertIn("git status --porcelain", ctx)
+        resumed = cowork.assemble_build_reviewer_resume_context(
+            pj, pm, status, build_summary_path=summary)
+        self.assertIn("SUMMARY-BODY", resumed)
+        self.assertIn("git status --porcelain", resumed)
+        # back-compat: without a summary path, none is embedded
+        ctx_no = cowork.assemble_build_reviewer_context(
+            "goal", ["builder"], pj, pm, status)
+        self.assertNotIn("SUMMARY-BODY", ctx_no)
+
+    def test_builder_gate_text_points_at_summary(self):
+        # builder_review_text / builder_done_text are overridden in run_builder
+        # to point at the summary path; assert the text producers render it.
+        self.assertIn("builder.summary.md",
+                      cowork.builder_review_text("/s/builder.summary.md"))
+        self.assertIn("builder.summary.md",
+                      cowork.builder_done_text("/s/builder.summary.md"))
+
+
+class HashGateStateTest(unittest.TestCase):
+    """cowork_state hash-gate primitives: scouting epoch, composite hash,
+    baseline persistence, and skip eligibility (every negative path)."""
+
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, "session.json")
+
+    def test_scouting_epoch_persisted_and_bumped(self):
+        path = self._tmp()
+        self.assertEqual(state_store.get_scouting_epoch(None), 0)
+        self.assertEqual(state_store.get_scouting_epoch({}), 0)
+        state = state_store.bump_scouting_epoch(path)
+        self.assertEqual(state_store.get_scouting_epoch(state), 1)
+        state = state_store.bump_scouting_epoch(path, prior=state)
+        self.assertEqual(state_store.get_scouting_epoch(state), 2)
+
+    def _write(self, path, body):
+        with open(path, "wb") as fh:
+            fh.write(body if isinstance(body, bytes) else body.encode("utf-8"))
+
+    def test_composite_hash_order_and_byte_sensitivity(self):
+        d = os.path.dirname(self._tmp())
+        a = os.path.join(d, "a.json")
+        b = os.path.join(d, "b.md")
+        self._write(a, "AAA")
+        self._write(b, "BBB")
+        h1 = state_store.composite_artifact_hash([a, b])
+        # order matters: swapping the member order changes the composite
+        self.assertNotEqual(h1, state_store.composite_artifact_hash([b, a]))
+        # stable when nothing changed
+        self.assertEqual(h1, state_store.composite_artifact_hash([a, b]))
+        # any byte change to any member changes the composite
+        self._write(b, "BBBx")
+        self.assertNotEqual(h1, state_store.composite_artifact_hash([a, b]))
+
+    def test_composite_hash_missing_member_sentinel(self):
+        d = os.path.dirname(self._tmp())
+        a = os.path.join(d, "a.json")
+        b = os.path.join(d, "b.md")
+        self._write(a, "AAA")
+        # b missing -> sentinel; differs from b present-but-empty
+        missing = state_store.composite_artifact_hash([a, b])
+        self._write(b, "")
+        present_empty = state_store.composite_artifact_hash([a, b])
+        self.assertNotEqual(missing, present_empty)
+
+    def test_baseline_record_get_roundtrip(self):
+        path = self._tmp()
+        state = state_store.record_review_baseline(
+            path, "scout-reviewer", 2, 3, "HASH-ABC")
+        got = state_store.get_review_baseline(state, "scout-reviewer")
+        self.assertEqual(got, {"epoch": 2, "context_revision": 3,
+                               "hash": "HASH-ABC"})
+        # persisted: reload from disk and it is still there
+        reloaded = state_store.load(path)
+        self.assertEqual(
+            state_store.get_review_baseline(reloaded, "scout-reviewer"),
+            {"epoch": 2, "context_revision": 3, "hash": "HASH-ABC"})
+        # absent for a different reviewer
+        self.assertIsNone(
+            state_store.get_review_baseline(state, "planning-advisor"))
+        self.assertIsNone(state_store.get_review_baseline(None, "scout-reviewer"))
+
+    def _state_with_baseline(self, reviewer, epoch, ctx_rev, h, acked):
+        return {
+            "version": 1,
+            "sessions": {
+                reviewer: {
+                    "last_approved_baseline": {
+                        "epoch": epoch, "context_revision": ctx_rev, "hash": h},
+                    "last_context_revision_seen": acked,
+                }
+            },
+        }
+
+    def test_skip_eligible_positive(self):
+        st = self._state_with_baseline("scout-reviewer", 2, 3, "H", acked=3)
+        self.assertTrue(state_store.review_skip_eligible(
+            st, "scout-reviewer", 2, 3, "H"))
+
+    def test_skip_not_eligible_no_baseline(self):
+        self.assertFalse(state_store.review_skip_eligible(
+            {}, "scout-reviewer", 0, 0, "H"))
+
+    def test_skip_not_eligible_hash_mismatch(self):
+        st = self._state_with_baseline("scout-reviewer", 2, 3, "H", acked=3)
+        self.assertFalse(state_store.review_skip_eligible(
+            st, "scout-reviewer", 2, 3, "DIFFERENT"))
+
+    def test_skip_not_eligible_epoch_mismatch(self):
+        st = self._state_with_baseline("scout-reviewer", 2, 3, "H", acked=3)
+        # a phase re-entry bumped the epoch -> the stale baseline cannot skip
+        self.assertFalse(state_store.review_skip_eligible(
+            st, "scout-reviewer", 3, 3, "H"))
+
+    def test_skip_not_eligible_unacked_newer_context(self):
+        # byte-identical, same epoch, but a newer context revision arrived that
+        # the reviewer never acked -> must NOT skip (a skip can't absorb context)
+        st = self._state_with_baseline("scout-reviewer", 2, 3, "H", acked=3)
+        self.assertFalse(state_store.review_skip_eligible(
+            st, "scout-reviewer", 2, 4, "H"))
+
+    def test_skip_not_eligible_acked_disagrees_with_baseline(self):
+        # the reviewer's acked revision no longer matches the baseline's recorded
+        # revision -> not the same approval authority -> no skip
+        st = self._state_with_baseline("scout-reviewer", 2, 3, "H", acked=2)
+        self.assertFalse(state_store.review_skip_eligible(
+            st, "scout-reviewer", 2, 3, "H"))
+
+
+class ReviewerHashGateLoopTest(unittest.TestCase):
+    """The hash-gate wired into the shared lead loop via `_scout_loop`: a
+    byte-identical, already-approved artifact skips the reviewer; any change (or
+    a non-approve prior verdict) re-reviews; the baseline survives a resume and
+    a clobbering lead-ack / phase-save."""
+
+    def _setup(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, "session.json")
+        state_store.save(spath, {"team": ["scout", "scout-reviewer"],
+                                 "config": {}, "sessions": {}})
+        intel = os.path.join(d, "scout.intel.json")
+        intel_md = os.path.join(d, "scout.intel.md")
+        with open(intel_md, "w") as fh:
+            fh.write("# intel markdown v1")
+        return spath, intel, intel_md
+
+    def _session(self, intel, status="ready_for_review"):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                with open(intel, "w") as fh:
+                    json.dump({"status": status}, fh)
+
+            def close(self):
+                self.closed = True
+        return FakeSession()
+
+    def _review_fn(self, verdicts):
+        calls = {"n": 0}
+
+        def review_fn(intel_path, round_index):
+            calls["n"] += 1
+            return verdicts.pop(0) if verdicts else {"verdict": "approve"}
+        review_fn.calls = calls
+        return review_fn
+
+    def _bundle(self, spath, covered, epoch=0, current_rev=0,
+                reviewer_role="scout-reviewer"):
+        # Mirrors run_flow.make_skip_baseline: closures over an in-memory holder
+        # threaded as `prior`, so record() updates state in place.
+        holder = {"state": state_store.load(spath)}
+        epoch_box = {"epoch": epoch}
+
+        def compute():
+            return state_store.composite_artifact_hash(covered)
+
+        def eligible(h):
+            return state_store.review_skip_eligible(
+                holder["state"], reviewer_role, epoch_box["epoch"],
+                current_rev, h)
+
+        def record(h):
+            holder["state"] = state_store.record_review_baseline(
+                spath, reviewer_role, epoch_box["epoch"], current_rev, h,
+                prior=holder["state"])
+        return cowork.SkipBaseline(compute, eligible, record), holder
+
+    def _run(self, spath, intel, intel_md, review_fn, bundle,
+             user_in="", evaluate_fn=None):
+        out = io.StringIO()
+        rc = cowork._scout_loop(
+            self._session(intel), "seed", intel, context="",
+            io_in=io.StringIO(user_in), io_out=out, review_fn=review_fn,
+            intel_md_path=intel_md, skip_baseline=bundle,
+            evaluate_fn=evaluate_fn)
+        return rc, out.getvalue()
+
+    def test_skip_on_identical_after_approve(self):
+        spath, intel, intel_md = self._setup()
+        covered = [intel, intel_md]
+        # Round 1: reviewer approves -> baseline seeded.
+        b1, _ = self._bundle(spath, covered)
+        rfn1 = self._review_fn([{"verdict": "approve"}])
+        rc, text1 = self._run(spath, intel, intel_md, rfn1, b1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rfn1.calls["n"], 1)
+        self.assertIn("reviewed: approved", text1)
+        # baseline landed on disk
+        self.assertIsNotNone(state_store.get_review_baseline(
+            state_store.load(spath), "scout-reviewer"))
+        # Round 2 (fresh bundle = resume): identical bytes -> reviewer SKIPPED.
+        b2, _ = self._bundle(spath, covered)
+        rfn2 = self._review_fn([{"verdict": "approve"}])
+        rc, text2 = self._run(spath, intel, intel_md, rfn2, b2)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rfn2.calls["n"], 0)             # reviewer NOT called
+        self.assertIn("review skipped", text2)            # visible marker
+        self.assertNotIn("reviewed: approved", text2)     # no reviewer marker
+        self.assertIn("scout finished", text2)            # user gate -> approved
+
+    def test_no_skip_when_md_member_changed(self):
+        spath, intel, intel_md = self._setup()
+        covered = [intel, intel_md]
+        b1, _ = self._bundle(spath, covered)
+        rc, _ = self._run(spath, intel, intel_md,
+                          self._review_fn([{"verdict": "approve"}]), b1)
+        self.assertEqual(rc, 0)
+        # change ONLY the markdown member -> composite differs -> re-review
+        with open(intel_md, "w") as fh:
+            fh.write("# intel markdown v2 (edited)")
+        b2, _ = self._bundle(spath, covered)
+        rfn2 = self._review_fn([{"verdict": "approve"}])
+        rc, text2 = self._run(spath, intel, intel_md, rfn2, b2)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rfn2.calls["n"], 1)              # reviewer DID run
+        self.assertNotIn("review skipped", text2)
+
+    def test_no_skip_when_prior_verdict_not_approve(self):
+        spath, intel, intel_md = self._setup()
+        covered = [intel, intel_md]
+        # A revise that rides to the cap: the user approves at the dissent gate,
+        # but the reviewer never returned `approve`, so NO baseline is seeded.
+        cap = cowork.REVIEW_ROUND_CAP
+        b1, holder1 = self._bundle(spath, covered)
+        rfn1 = self._review_fn(
+            [{"verdict": "revise", "findings": ["x"]} for _ in range(cap + 1)])
+        # _session writes ready_for_review on each send; the revise loop bounces
+        # the role, so allow many statuses by reusing the default.
+        rc, _ = self._run(spath, intel, intel_md, rfn1, b1)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(state_store.get_review_baseline(
+            state_store.load(spath), "scout-reviewer"))
+        # Next round, unchanged bytes: still NO skip (no approved baseline).
+        b2, _ = self._bundle(spath, covered)
+        rfn2 = self._review_fn([{"verdict": "approve"}])
+        rc, text2 = self._run(spath, intel, intel_md, rfn2, b2)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rfn2.calls["n"], 1)              # reviewer ran
+        self.assertNotIn("review skipped", text2)
+
+    def test_no_skip_after_epoch_bump(self):
+        spath, intel, intel_md = self._setup()
+        covered = [intel, intel_md]
+        b1, _ = self._bundle(spath, covered, epoch=0)
+        self._run(spath, intel, intel_md,
+                  self._review_fn([{"verdict": "approve"}]), b1)
+        # a planner -> scout hand-back bumps the scouting epoch
+        b2, _ = self._bundle(spath, covered, epoch=1)
+        rfn2 = self._review_fn([{"verdict": "approve"}])
+        rc, text2 = self._run(spath, intel, intel_md, rfn2, b2)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rfn2.calls["n"], 1)              # epoch moved -> review
+        self.assertNotIn("review skipped", text2)
+
+    def test_skipped_round_runs_no_eval(self):
+        spath, intel, intel_md = self._setup()
+        covered = [intel, intel_md]
+        evals = {"n": 0}
+
+        def evaluate_fn(session, verdict, round_index):
+            evals["n"] += 1
+
+        b1, _ = self._bundle(spath, covered)
+        self._run(spath, intel, intel_md,
+                  self._review_fn([{"verdict": "approve"}]), b1,
+                  evaluate_fn=evaluate_fn)
+        self.assertEqual(evals["n"], 1)                   # round 1 scored
+        # Round 2 skips the reviewer -> no eval turn for the skipped round.
+        b2, _ = self._bundle(spath, covered)
+        rfn2 = self._review_fn([{"verdict": "approve"}])
+        self._run(spath, intel, intel_md, rfn2, b2, evaluate_fn=evaluate_fn)
+        self.assertEqual(rfn2.calls["n"], 0)
+        self.assertEqual(evals["n"], 1)                   # unchanged: no new eval
+
+    def test_baseline_survives_clobbering_lead_ack_and_phase_save(self):
+        # REGRESSION: record() updates the in-memory holder in place, so a later
+        # mark_context_seen / save_phase that threads that same holder does NOT
+        # overwrite the freshly written baseline.
+        spath, intel, intel_md = self._setup()
+        covered = [intel, intel_md]
+        b1, holder = self._bundle(spath, covered)
+        rc, _ = self._run(spath, intel, intel_md,
+                         self._review_fn([{"verdict": "approve"}]), b1)
+        self.assertEqual(rc, 0)
+        # holder['state'] now carries the baseline (record reassigned it).
+        self.assertIsNotNone(state_store.get_review_baseline(
+            holder["state"], "scout-reviewer"))
+        # Simulate run_flow's post-loop saves, threading the SAME holder.
+        holder["state"] = state_store.mark_context_seen(
+            spath, "scout", 0, prior=holder["state"])
+        holder["state"] = state_store.save_phase(
+            spath, "planning", prior=holder["state"])
+        # On disk, the baseline is still present and still qualifies a skip.
+        reloaded = state_store.load(spath)
+        self.assertIsNotNone(state_store.get_review_baseline(
+            reloaded, "scout-reviewer"))
+        self.assertTrue(state_store.review_skip_eligible(
+            reloaded, "scout-reviewer", 0, 0,
+            state_store.composite_artifact_hash(covered)))
+
+
+class RunLevelGateSurfaceTest(unittest.TestCase):
+    """The .md review surfaces must reach the user at the RUN level (run_scout /
+    run_builder), not only inside the loop helper — the start banner included."""
+
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def _codex_session(self, status_path):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                with open(status_path, "w") as fh:
+                    json.dump({"status": "ready_for_review", "result": {}}, fh)
+
+            def close(self):
+                pass
+        return FakeSession()
+
+    def test_run_scout_start_banner_points_at_intel_md(self):
+        d = self._tmp()
+        intel = os.path.join(d, "scout.intel.json")
+        intel_md = os.path.join(d, "scout.intel.md")
+        sess = self._codex_session(intel)
+        config = cowork.default_config(["scout"])
+        config["scout"]["controller"] = "codex"
+        out = io.StringIO()
+        rc = cowork.run_scout(
+            config, "seed", ["scout"], io_in=io.StringIO(""), io_out=out,
+            intel_path=intel, intel_md_path=intel_md,
+            session_factory=lambda *a, **k: sess)
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        # the start banner (and the review/done gates) surface the markdown
+        self.assertIn("scout.intel.md", text)
+        self.assertIn("scout — gathering context", text)   # the start banner ran
+        self.assertNotIn("scout.intel.json", text)         # not the raw JSON
+
+    def test_run_builder_gate_surfaces_point_at_summary_md(self):
+        d = self._tmp()
+        status = os.path.join(d, "builder.status.json")
+        summary = os.path.join(d, "builder.summary.md")
+        pj = os.path.join(d, "plan.json")
+        pm = os.path.join(d, "plan.md")
+        for p, body in ((pj, "{}"), (pm, "# PLAN")):
+            with open(p, "w") as fh:
+                fh.write(body)
+        sess = self._codex_session(status)
+        config = cowork.default_config(["builder"])
+        config["builder"]["controller"] = "codex"
+        out = io.StringIO()
+        rc = cowork.run_builder(
+            config, "seed", ["builder"], io_in=io.StringIO(""), io_out=out,
+            build_status_path=status, build_summary_path=summary,
+            plan_json_path=pj, plan_md_path=pm,
+            session_factory=lambda *a, **k: sess,
+            on_outcome=lambda o, p: None)
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        # start banner + ready-for-review gate + done gate all point at summary.md
+        self.assertIn("builder.summary.md", text)
+        self.assertIn("build ready for review", text)
+        self.assertIn("builder finished", text)
+        self.assertNotIn("builder.status.json", text)      # not the status JSON
+
+
+class PlannerHashGateRunTest(unittest.TestCase):
+    """The hash-gate at the run level for the PLANNER / planning-advisor pairing
+    over its own composite [planner.plan.json, planner.plan.md] — the planner
+    bundle is constructed separately from the scout's, so it gets its own
+    skip / no-skip coverage."""
+
+    def _setup(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        spath = os.path.join(d, "session.json")
+        state_store.save(spath, {"team": ["planner", "planning-advisor"],
+                                 "config": {}, "sessions": {}})
+        plan_json = os.path.join(d, "planner.plan.json")
+        plan_md = os.path.join(d, "planner.plan.md")
+        with open(plan_md, "w") as fh:
+            fh.write("# plan markdown v1")
+        review = os.path.join(d, "planner-review.json")
+        return spath, plan_json, plan_md, review
+
+    def _session(self, plan_json):
+        class FakeSession:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                with open(plan_json, "w") as fh:
+                    json.dump({"session": "X", "role": "planner",
+                               "status": "ready_for_review", "result": {}}, fh)
+
+            def close(self):
+                pass
+        return FakeSession()
+
+    def _bundle(self, spath, covered, epoch=0, current_rev=0):
+        holder = {"state": state_store.load(spath)}
+        epoch_box = {"epoch": epoch}
+
+        def compute():
+            return state_store.composite_artifact_hash(covered)
+
+        def eligible(h):
+            return state_store.review_skip_eligible(
+                holder["state"], "planning-advisor", epoch_box["epoch"],
+                current_rev, h)
+
+        def record(h):
+            holder["state"] = state_store.record_review_baseline(
+                spath, "planning-advisor", epoch_box["epoch"], current_rev, h,
+                prior=holder["state"])
+        return cowork.SkipBaseline(compute, eligible, record)
+
+    def _run(self, spath, plan_json, plan_md, review, bundle, runner):
+        out = io.StringIO()
+        config = cowork.default_config(["planner", "planning-advisor"])
+        config["planner"]["controller"] = "codex"
+        rc = cowork.run_planner(
+            config, "seed", ["planner", "planning-advisor"],
+            io_in=io.StringIO(""), io_out=out,
+            plan_json_path=plan_json, plan_md_path=plan_md, review_path=review,
+            session_factory=lambda *a, **k: self._session(plan_json),
+            reviewer_runner=runner, skip_baseline=bundle,
+            on_outcome=lambda o, p: None)
+        return rc, out.getvalue()
+
+    def _runner(self, calls):
+        def runner(config, context, selected, p, review_path, **kw):
+            calls.append(p)
+            return {"verdict": "approve"}
+        return runner
+
+    def test_planner_skip_on_identical_then_no_skip_on_md_change(self):
+        spath, plan_json, plan_md, review = self._setup()
+        covered = [plan_json, plan_md]
+        # Round 1: advisor approves -> planner baseline seeded.
+        calls1 = []
+        rc, text1 = self._run(spath, plan_json, plan_md, review,
+                              self._bundle(spath, covered), self._runner(calls1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls1), 1)                 # advisor ran
+        self.assertIsNotNone(state_store.get_review_baseline(
+            state_store.load(spath), "planning-advisor"))
+        # Round 2 (resume): identical composite -> advisor SKIPPED.
+        calls2 = []
+        rc, text2 = self._run(spath, plan_json, plan_md, review,
+                              self._bundle(spath, covered), self._runner(calls2))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls2), 0)                 # advisor NOT called
+        self.assertIn("review skipped", text2)
+        self.assertIn("planner finished", text2)         # approval reused
+        # Round 3: a plan.md-only edit -> composite differs -> advisor re-runs.
+        with open(plan_md, "w") as fh:
+            fh.write("# plan markdown v2 (edited)")
+        calls3 = []
+        rc, text3 = self._run(spath, plan_json, plan_md, review,
+                              self._bundle(spath, covered), self._runner(calls3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls3), 1)                 # advisor ran again
+        self.assertNotIn("review skipped", text3)
+
+
 if __name__ == "__main__":
     unittest.main()
