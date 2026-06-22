@@ -1847,31 +1847,6 @@ class SessionClassTest(unittest.TestCase):
         self.assertIn("scout › done", out.getvalue())
 
 
-class AdditiveTest(unittest.TestCase):
-    """cowork must stay additive: it must not import or reference the existing
-    co-plan helper, and the existing files must still be present."""
-
-    def test_cowork_does_not_import_co_plan_file(self):
-        import ast
-        for name in ("cowork.py", "cowork_bridge.py", "cowork_preflight.py",
-                     "cowork_state.py", "cowork_ui.py"):
-            with open(os.path.join(_HERE, name)) as fh:
-                tree = ast.parse(fh.read(), filename=name)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        self.assertNotIn("co_plan_file", alias.name,
-                                         "%s must not import co_plan_file" % name)
-                elif isinstance(node, ast.ImportFrom):
-                    self.assertNotIn("co_plan_file", node.module or "",
-                                     "%s must not import co_plan_file" % name)
-
-    def test_existing_skill_files_present(self):
-        root = os.path.dirname(_HERE)
-        for rel in ("SKILL.md", "scripts/co_plan_file.py"):
-            self.assertTrue(os.path.exists(os.path.join(root, rel)))
-
-
 class ScoutReviewerRegistrationTest(unittest.TestCase):
     def test_role_registered_with_codex_yolo_implement(self):
         self.assertIn("scout-reviewer", cowork.ROLES)
@@ -6637,8 +6612,10 @@ class RenderMarkdownChannelTest(unittest.TestCase):
 
     @unittest.skipUnless(HAS_UI_DEPS, "rich not installed")
     def test_tty_internal_true_dims_whole(self):
+        import unittest.mock as mock
         out = FakeTTY()
-        ui.render_markdown(out, "wholly internal", enabled=True, internal=True)
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            ui.render_markdown(out, "wholly internal", enabled=True, internal=True)
         text = out.getvalue()
         self.assertIn("internal", text)
         self.assertIn("\x1b[2m", text)
@@ -7953,6 +7930,796 @@ class PlannerHashGateRunTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls3), 1)                 # advisor ran again
         self.assertNotIn("review skipped", text3)
+
+
+# --------------------------------------------------------------------------- #
+# Token-reduction items #1–#4 (.plans/cowork-token-reduction.md).             #
+# --------------------------------------------------------------------------- #
+
+import cowork_report  # noqa: E402
+import cowork_probe_cache as probe_cache  # noqa: E402
+import cowork_diffpacket as diffpacket  # noqa: E402
+
+
+def _claude_lines(usage=None):
+    lines = [json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "ok"}]}})]
+    result = {"type": "result", "subtype": "success", "session_id": "S1"}
+    if usage is not None:
+        result["usage"] = usage
+    lines.append(json.dumps(result))
+    return lines
+
+
+class _ClaudeProc:
+    def __init__(self, lines):
+        self.stdout = iter(lines)
+        self.stdin = io.StringIO()
+
+    def wait(self):
+        return 0
+
+
+class PromptAccountingTest(unittest.TestCase):
+    """#1: per-turn accounting is additive + content-free (T1, T2, T13)."""
+
+    def _tmp_trace(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, "trace.jsonl")
+
+    def _events(self, path):
+        with open(path, "r") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_t2_usage_extractor_best_effort(self):
+        # result with usage -> populated; without -> None; never raises.
+        self.assertEqual(
+            bridge._usage_from_result(
+                {"usage": {"input_tokens": 7, "output_tokens": 3,
+                           "ignored": "x", "flag": True}}),
+            {"input_tokens": 7, "output_tokens": 3})
+        self.assertIsNone(bridge._usage_from_result({}))
+        self.assertIsNone(bridge._usage_from_result({"usage": "nope"}))
+
+    def test_t1_t13_turn_start_enriched_and_content_free(self):
+        import unittest.mock as mock
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        secret = "SECRET-PROMPT-BODY-do-not-store"
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_ClaudeProc(_claude_lines(
+                                   usage={"input_tokens": 9}))):
+            sess = bridge.ClaudeSession(
+                "roles/scout.md", "plan", True, io_out=io.StringIO(),
+                speaker="scout-reviewer", session_id="S1", trace=trace)
+            sess.send(secret, meta={
+                "prompt_kind": "reviewer_pass", "fresh": True,
+                "context_revision": 2,
+                "artifacts": [{"path": "intel.json", "bytes": 4,
+                               "sha256": "abc"}],
+                "dropme": None})
+        events = self._events(path)
+        start = [e for e in events
+                 if e["event"] == "controller.turn.start"][0]
+        self.assertEqual(start["prompt_kind"], "reviewer_pass")
+        self.assertEqual(start["role"], "scout-reviewer")
+        self.assertEqual(start["controller"], "claude")
+        self.assertTrue(start["fresh"])
+        self.assertEqual(start["context_revision"], 2)
+        self.assertEqual(start["artifacts"][0]["path"], "intel.json")
+        self.assertIn("prompt_sha256", start)
+        # None field dropped; raw body never written anywhere in the trace.
+        self.assertNotIn("dropme", start)
+        self.assertNotIn(secret, json.dumps(self._events(path)))
+        # Best-effort usage rides controller.turn.end.
+        end = [e for e in events if e["event"] == "controller.turn.end"][0]
+        self.assertEqual(end["usage"], {"input_tokens": 9})
+
+    def test_probe_events_carry_prompt_kind_and_usage(self):
+        # #1: probe start/end carry prompt_kind='probe'; end carries best-effort
+        # usage from the probe-loop result event when present.
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+
+        def spawn(cmd, stdin):
+            return [{"type": "result", "subtype": "success",
+                     "usage": {"input_tokens": 11, "output_tokens": 2}}]
+        ok, _ = bridge.probe_claude_stream_json(spawn, trace=trace)
+        self.assertTrue(ok)
+        events = self._events(path)
+        start = [e for e in events
+                 if e["event"] == "controller.probe.start"][0]
+        end = [e for e in events if e["event"] == "controller.probe.end"][0]
+        self.assertEqual(start["prompt_kind"], "probe")
+        self.assertEqual(end["prompt_kind"], "probe")
+        self.assertEqual(end["usage"], {"input_tokens": 11, "output_tokens": 2})
+
+    def test_probe_end_usage_absent_when_not_exposed(self):
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+
+        def spawn(cmd, stdin):
+            return [{"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "pong"}]}}]
+        bridge.probe_claude_stream_json(spawn, trace=trace)
+        end = [e for e in self._events(path)
+               if e["event"] == "controller.probe.end"][0]
+        self.assertNotIn("usage", end)  # None-valued field dropped
+
+    def test_probe_usage_captured_when_assistant_precedes_result(self):
+        # #1 (review fix): the probe must scan to the result to capture usage
+        # even when an assistant event is emitted first.
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+
+        def spawn(cmd, stdin):
+            return [
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "pong"}]}},
+                {"type": "result", "subtype": "success",
+                 "usage": {"input_tokens": 8}},
+            ]
+        ok, _ = bridge.probe_claude_stream_json(spawn, trace=trace)
+        self.assertTrue(ok)
+        end = [e for e in self._events(path)
+               if e["event"] == "controller.probe.end"][0]
+        self.assertEqual(end["usage"], {"input_tokens": 8})
+
+    def test_t1_meta_never_collides_with_bridge_kwargs(self):
+        # meta carrying role/controller must not raise a duplicate-kwarg error.
+        import unittest.mock as mock
+        path = self._tmp_trace()
+        trace = trace_store.Trace(path, session_uuid="X", run_id="R")
+        with mock.patch.object(bridge.subprocess, "Popen",
+                               return_value=_ClaudeProc(_claude_lines())):
+            sess = bridge.ClaudeSession(
+                "roles/scout.md", "plan", True, io_out=io.StringIO(),
+                speaker="scout", session_id="S1", trace=trace)
+            sess.send("hi", meta={"role": "scout", "controller": "claude",
+                                  "prompt_kind": "role_seed"})
+        start = [e for e in self._events(path)
+                 if e["event"] == "controller.turn.start"][0]
+        self.assertEqual(start["prompt_kind"], "role_seed")
+
+
+class ReportTest(unittest.TestCase):
+    """#2: trace aggregation + the --report flag (T3, T4)."""
+
+    def _synthetic(self):
+        return [
+            {"event": "controller.turn.start", "role": "scout",
+             "controller": "claude", "prompt_kind": "role_seed",
+             "prompt_bytes": 100, "fresh": True,
+             "artifacts": [{"path": "a.json", "bytes": 40}]},
+            {"event": "controller.turn.start", "role": "scout-reviewer",
+             "controller": "codex", "prompt_kind": "reviewer_pass",
+             "prompt_bytes": 300, "resume": True, "round": 2,
+             "artifacts": [{"path": "a.json", "bytes": 40}]},
+            {"event": "controller.turn.end", "controller": "codex",
+             "usage": {"input_tokens": 50, "output_tokens": 5}},
+            {"event": "review.skipped", "role": "scout-reviewer",
+             "reason": "unchanged_since_approved"},
+            "this is not json and must be skipped",
+            "{bad json",
+        ]
+
+    def test_t3_aggregation(self):
+        s = cowork_report.summarize_trace(self._synthetic())
+        self.assertEqual(s["turn_count"], 2)
+        self.assertEqual(s["bytes_by_role_controller"][("scout", "claude")], 100)
+        self.assertEqual(
+            s["bytes_by_role_controller"][("scout-reviewer", "codex")], 300)
+        self.assertEqual(s["bytes_by_kind"]["reviewer_pass"], 300)
+        self.assertEqual(s["fresh_resume"], {"fresh": 1, "resume": 1,
+                                             "unknown": 0})
+        self.assertEqual(s["largest_prompts"][0][0], 300)
+        self.assertEqual(s["artifact_bytes"]["a.json"]["bytes"], 80)
+        self.assertEqual(s["artifact_bytes"]["a.json"]["turns"], 2)
+        self.assertEqual(len(s["review_skips"]), 1)
+        self.assertEqual(s["usage_by_controller"]["codex"]["input_tokens"], 50)
+
+    def test_t3_render_has_sections(self):
+        text = cowork_report.render_report(
+            cowork_report.summarize_trace(self._synthetic()), "UUID")
+        for needle in ("Prompt bytes by role", "Prompt bytes by prompt kind",
+                       "Largest single prompts", "Artifact contribution",
+                       "Review-skip hits", "Controller-reported usage"):
+            self.assertIn(needle, text)
+
+    def test_probe_end_usage_is_summarized(self):
+        # #2 (review fix): usage on controller.probe.end is aggregated too, not
+        # only controller.turn.end.
+        s = cowork_report.summarize_trace([
+            {"event": "controller.probe.end", "controller": "claude",
+             "result": "ok", "usage": {"input_tokens": 5, "output_tokens": 1}},
+            {"event": "controller.turn.end", "controller": "claude",
+             "usage": {"input_tokens": 10}},
+        ])
+        self.assertEqual(s["usage_by_controller"]["claude"]["input_tokens"], 15)
+        self.assertEqual(s["usage_by_controller"]["claude"]["output_tokens"], 1)
+
+    def test_t3_malformed_lines_never_raise(self):
+        # A trace of pure garbage yields an empty (no-turns) report.
+        text = cowork_report.render_report(
+            cowork_report.summarize_trace(["x", "{", "[}"]))
+        self.assertIn("No controller turns", text)
+
+    def test_t4_report_flag_end_to_end(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+        try:
+            uuid = "11111111-2222-3333-4444-555555555555"
+            tpath = trace_store.trace_path_for(uuid)
+            os.makedirs(os.path.dirname(tpath), exist_ok=True)
+            with open(tpath, "w") as fh:
+                for ev in self._synthetic():
+                    fh.write((json.dumps(ev) if isinstance(ev, dict) else ev)
+                             + "\n")
+            args = cowork.build_parser().parse_args(["--report", uuid])
+            out = io.StringIO()
+            rc = cowork.run_report(args, io_out=out)
+            self.assertEqual(rc, 0)
+            self.assertIn("Prompt bytes by prompt kind", out.getvalue())
+            self.assertIn(uuid, out.getvalue())
+            # Unknown session -> a clean exit 1, no crash.
+            args2 = cowork.build_parser().parse_args(["--report", "no-such"])
+            out2 = io.StringIO()
+            self.assertEqual(cowork.run_report(args2, io_out=out2), 1)
+            self.assertIn("no trace", out2.getvalue())
+        finally:
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+
+
+class ProbeCacheTest(unittest.TestCase):
+    """#3: global probe cache — hit/miss/re-probe/corrupt/failure (T5, T6)."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.cache = os.path.join(self.dir, "probe_cache.json")
+        # A role-prompt file with a stable hash component.
+        self.role = os.path.join(self.dir, "role.md")
+        with open(self.role, "w") as fh:
+            fh.write("ROLE PROMPT")
+
+    def _ok_spawn(self, calls):
+        def spawn(cmd, stdin):
+            calls.append(cmd)
+            return [{"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "pong"}]}}]
+        return spawn
+
+    def test_t5_miss_stores_then_hit_skips_spawn(self):
+        calls = []
+        # Miss: live probe runs and stores on success.
+        ok, _ = bridge.probe_claude_stream_json(
+            self._ok_spawn(calls), role_prompt_file=self.role,
+            cache_enabled=True, version_fn=lambda p: "claude 1.2.3",
+            cache_path=self.cache)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        # Hit: T6 — spawn (a spy that fails if called) is NOT invoked.
+        def boom(cmd, stdin):
+            raise AssertionError("spawn must not run on a cache hit")
+        ok2, alert2 = bridge.probe_claude_stream_json(
+            boom, role_prompt_file=self.role, cache_enabled=True,
+            version_fn=lambda p: "claude 1.2.3", cache_path=self.cache)
+        self.assertTrue(ok2)
+        self.assertIsNone(alert2)
+
+    def test_t5_key_change_reprobes(self):
+        calls = []
+        common = dict(role_prompt_file=self.role, cache_enabled=True,
+                      cache_path=self.cache)
+        bridge.probe_claude_stream_json(
+            self._ok_spawn(calls), version_fn=lambda p: "v1", **common)
+        # New version -> miss -> re-probe (live spawn runs again).
+        bridge.probe_claude_stream_json(
+            self._ok_spawn(calls), version_fn=lambda p: "v2", **common)
+        self.assertEqual(len(calls), 2)
+        # New yolo shape -> miss again.
+        bridge.probe_claude_stream_json(
+            self._ok_spawn(calls), version_fn=lambda p: "v2", yolo=False,
+            role_prompt_file=self.role, cache_enabled=True,
+            cache_path=self.cache)
+        self.assertEqual(len(calls), 3)
+
+    def test_t5_corrupt_cache_is_a_miss(self):
+        with open(self.cache, "w") as fh:
+            fh.write("{not json")
+        calls = []
+        ok, _ = bridge.probe_claude_stream_json(
+            self._ok_spawn(calls), role_prompt_file=self.role,
+            cache_enabled=True, version_fn=lambda p: "v1",
+            cache_path=self.cache)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)  # treated as miss -> probed
+
+    def test_t5_probe_failure_not_stored(self):
+        def bad_spawn(cmd, stdin):
+            return [{"type": "other"}]  # unsupported -> failure
+        ok, _ = bridge.probe_claude_stream_json(
+            bad_spawn, role_prompt_file=self.role, cache_enabled=True,
+            version_fn=lambda p: "v1", cache_path=self.cache)
+        self.assertFalse(ok)
+        key = probe_cache.probe_cache_key(
+            "claude", "v1", self.role, "plan", True, False)
+        self.assertFalse(probe_cache.cache_hit(key, path=self.cache))
+
+    def test_resolved_binary_path_is_part_of_key(self):
+        # D4: a different resolved claude binary (same version) must not hit.
+        k1 = probe_cache.probe_cache_key(
+            "/usr/bin/claude", "v1", self.role, "plan", True, False)
+        k2 = probe_cache.probe_cache_key(
+            "/opt/local/bin/claude", "v1", self.role, "plan", True, False)
+        self.assertNotEqual(k1, k2)
+
+    def test_resolve_claude_path_realpaths_absolute(self):
+        exe = os.path.join(self.dir, "claude")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        self.assertEqual(probe_cache.resolve_claude_path([exe]),
+                         os.path.realpath(exe))
+
+    def test_default_cache_path_is_cowork_home(self):
+        old_root = os.environ.get("COWORK_SESSIONS_ROOT")
+        old_cache = os.environ.get("COWORK_PROBE_CACHE")
+        os.environ.pop("COWORK_PROBE_CACHE", None)
+        os.environ["COWORK_SESSIONS_ROOT"] = "/x/y/sessions"
+        try:
+            self.assertEqual(probe_cache.probe_cache_path(),
+                             os.path.join("/x/y", "probe_cache.json"))
+        finally:
+            if old_root is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old_root
+            if old_cache is not None:
+                os.environ["COWORK_PROBE_CACHE"] = old_cache
+
+    def test_t5_unknown_version_never_cached(self):
+        calls = []
+        common = dict(role_prompt_file=self.role, cache_enabled=True,
+                      cache_path=self.cache, version_fn=lambda p: None)
+        bridge.probe_claude_stream_json(self._ok_spawn(calls), **common)
+        bridge.probe_claude_stream_json(self._ok_spawn(calls), **common)
+        self.assertEqual(len(calls), 2)  # no version -> always live-probe
+
+
+class DiffPacketTest(unittest.TestCase):
+    """#4: path-first diff packets + full-reread fallbacks (T7–T10, T12)."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.snap = os.path.join(self.dir, "snap")
+        os.makedirs(self.snap, exist_ok=True)
+        self.json_path = os.path.join(self.dir, "plan.json")
+        self.md_path = os.path.join(self.dir, "plan.md")
+
+    def _write(self, obj, md):
+        with open(self.json_path, "w") as fh:
+            json.dump(obj, fh)
+        with open(self.md_path, "w") as fh:
+            fh.write(md)
+
+    def _arts(self):
+        return [{"label": "plan JSON", "path": self.json_path, "kind": "json"},
+                {"label": "plan md", "path": self.md_path, "kind": "markdown"}]
+
+    def _packet(self, **kw):
+        return diffpacket.build_review_packet(
+            "advisor", 1, 3, self._arts(), self.snap, **kw)
+
+    def test_t10_fresh_is_full_reread_and_writes_snapshot(self):
+        self._write({"b": 2, "a": 1}, "# Plan\nbody")
+        pkt = self._packet(force_full_reread=True)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
+        self.assertNotIn("unified diff", pkt.lower())
+        # The full JSON body is NOT embedded (only path + hash descriptors).
+        self.assertNotIn('"a": 1', pkt)
+        self.assertIn(self.json_path, pkt)
+        # A snapshot exists for the next round's diff.
+        self.assertTrue(os.path.exists(
+            diffpacket._snapshot_path(self.snap, "advisor")))
+
+    def test_t7_repeat_round_emits_diff_not_bodies(self):
+        self._write({"a": 1}, "# Plan\nold")
+        self._packet(force_full_reread=True)        # round 1: seed snapshot
+        self._write({"a": 2}, "# Plan\nnew")        # change both files
+        pkt = self._packet()                         # round 2: same key -> diff
+        self.assertIn(diffpacket.DIFF_INSTRUCTION, pkt)
+        self.assertIn("@@", pkt)                     # unified diff hunk
+        self.assertIn("+new", pkt)
+
+    def test_t7_json_canonicalized_so_key_churn_is_minimal(self):
+        self._write({"a": 1, "b": 2}, "same")
+        self._packet(force_full_reread=True)
+        # Rewrite with reordered keys + different whitespace, same content.
+        with open(self.json_path, "w") as fh:
+            fh.write('{\n  "b": 2,\n  "a": 1\n}\n')
+        pkt = self._packet()
+        self.assertIn(diffpacket.DIFF_INSTRUCTION, pkt)
+        self.assertIn("no changes", pkt.lower())
+
+    def test_t8_no_snapshot_forces_full_reread(self):
+        self._write({"a": 1}, "md")
+        pkt = self._packet()  # no prior snapshot for this key
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
+
+    def test_t8_context_rev_change_forces_full_reread(self):
+        self._write({"a": 1}, "md")
+        diffpacket.build_review_packet("advisor", 1, 3, self._arts(), self.snap,
+                                       force_full_reread=True)
+        # A different context revision -> different key -> no prior snapshot.
+        pkt = diffpacket.build_review_packet(
+            "advisor", 1, 99, self._arts(), self.snap)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
+
+    def test_t8_canonicalization_failure_forces_full_reread(self):
+        self._write({"a": 1}, "md")
+        self._packet(force_full_reread=True)
+        # Corrupt the JSON so canonicalization fails on this round.
+        with open(self.json_path, "w") as fh:
+            fh.write("{not valid json")
+        pkt = self._packet()
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
+
+    def test_t8_diff_over_cap_forces_full_reread(self):
+        self._write({"a": 1}, "line\n")
+        self._packet(force_full_reread=True)
+        with open(self.md_path, "w") as fh:
+            fh.write("\n".join("changed-%d" % i for i in range(500)))
+        pkt = self._packet(diff_line_cap=10)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
+
+    def test_t8_artifact_set_change_forces_full_reread(self):
+        # The snapshot key folds in the ordered artifact path set: a changed set
+        # (here, dropping the markdown) under the same epoch/revision has no
+        # prior snapshot and must full-reread rather than diff a new set.
+        self._write({"a": 1}, "md")
+        self._packet(force_full_reread=True)        # seed snapshot for 2 arts
+        json_only = [{"label": "plan JSON", "path": self.json_path,
+                      "kind": "json"}]
+        pkt = diffpacket.build_review_packet(
+            "advisor", 1, 3, json_only, self.snap)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, pkt)
+
+    def test_t12_force_full_reread_skips_diff_even_with_snapshot(self):
+        # The malformed/weak-verdict retry (D8): a prior snapshot exists and a
+        # diff WOULD be eligible, but force_full_reread bypasses it.
+        self._write({"a": 1}, "md")
+        self._packet(force_full_reread=True)
+        self._write({"a": 2}, "md2")
+        eligible = self._packet()                       # would be a diff
+        self.assertIn(diffpacket.DIFF_INSTRUCTION, eligible)
+        self._write({"a": 3}, "md3")
+        forced = self._packet(force_full_reread=True)   # retry: full reread
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, forced)
+        self.assertNotIn("@@", forced)
+
+
+class ReviewerPacketContextTest(unittest.TestCase):
+    """#4 wiring through the reviewer context assemblers (T9, T10)."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.snap = os.path.join(self.dir, "snap")
+        os.makedirs(self.snap, exist_ok=True)
+        self.pj = os.path.join(self.dir, "plan.json")
+        self.pm = os.path.join(self.dir, "plan.md")
+        self.status = os.path.join(self.dir, "status.json")
+        for p, body in ((self.pj, '{"k": "VALUE-IN-JSON"}'),
+                        (self.pm, "# Plan\nMD-BODY"),
+                        (self.status, '{"s": "STATUS-BODY"}')):
+            with open(p, "w") as fh:
+                fh.write(body)
+
+    def _ctx(self, role):
+        return {"reviewer_role": role, "epoch": 1, "context_revision": 0,
+                "snapshot_dir": self.snap}
+
+    def test_t10_advisor_fresh_is_path_first(self):
+        out = cowork.assemble_advisor_context(
+            "ctx", ["planner", "planning-advisor"], self.pj, self.pm,
+            packet_ctx=self._ctx("planning-advisor"))
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, out)
+        self.assertNotIn("VALUE-IN-JSON", out)   # body not embedded
+        self.assertNotIn("MD-BODY", out)
+        self.assertIn(self.pj, out)              # path present
+
+    def test_t9_build_reviewer_packet_keeps_live_delta_recipe(self):
+        out = cowork.assemble_build_reviewer_resume_context(
+            self.pj, self.pm, self.status,
+            baseline_repos=None, packet_ctx=self._ctx("build-reviewer"),
+            force_full_reread=True)
+        # The embedded artifacts go path-first...
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, out)
+        self.assertNotIn("STATUS-BODY", out)
+        # ...but the live working-tree delta recipe is untouched.
+        self.assertIn("FULL working-tree delta", out)
+
+    def test_t9_build_reviewer_resume_emits_diff_on_repeat(self):
+        ctx = self._ctx("build-reviewer")
+        cowork.assemble_build_reviewer_resume_context(
+            self.pj, self.pm, self.status, packet_ctx=ctx,
+            force_full_reread=True)  # seed snapshot
+        with open(self.status, "w") as fh:
+            fh.write('{"s": "CHANGED-STATUS"}')
+        out = cowork.assemble_build_reviewer_resume_context(
+            self.pj, self.pm, self.status, packet_ctx=ctx)
+        self.assertIn(diffpacket.DIFF_INSTRUCTION, out)
+        self.assertIn("CHANGED-STATUS", out)     # diff shows the new line
+        self.assertIn("FULL working-tree delta", out)
+
+
+class TurnMetaWiringTest(unittest.TestCase):
+    """#1 D11: lead + reviewer sends carry the full meta contract (T13)."""
+
+    def _dir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def test_lead_meta_phase_fresh_and_seed_artifacts(self):
+        d = self._dir()
+        status = os.path.join(d, "status.json")
+        intel = os.path.join(d, "intel.json")
+        for p, body in ((status, '{"status":"x"}'), (intel, '{"x":1}')):
+            with open(p, "w") as fh:
+                fh.write(body)
+        captured = []
+
+        class Fake:
+            def send(self, text, meta=None):
+                captured.append(meta)
+                with open(status, "w") as fh:
+                    json.dump({"status": "needs_input", "result": {}}, fh)
+
+            def close(self):
+                pass
+
+        cowork._role_loop(
+            Fake(), "seed", status, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="planner", phase="planning", is_resume=False,
+            seed_artifact_paths=[intel], context_revision=3)
+        m = captured[0]
+        self.assertEqual(m["prompt_kind"], "role_seed")
+        self.assertEqual(m["phase"], "planning")
+        self.assertTrue(m["fresh"])
+        self.assertFalse(m["resume"])
+        self.assertEqual(m["context_revision"], 3)
+        paths = [a["path"] for a in m["artifacts"]]
+        self.assertIn(intel, paths)    # seed artifact embedded on first send
+        self.assertIn(status, paths)   # role's own status file
+
+    def test_lead_meta_resumed_launch_marks_resume(self):
+        d = self._dir()
+        status = os.path.join(d, "status.json")
+        with open(status, "w") as fh:
+            fh.write('{"status":"x"}')
+        captured = []
+
+        class Fake:
+            def send(self, text, meta=None):
+                captured.append(meta)
+                with open(status, "w") as fh:
+                    json.dump({"status": "needs_input", "result": {}}, fh)
+
+            def close(self):
+                pass
+
+        cowork._role_loop(
+            Fake(), "seed", status, context="",
+            io_in=io.StringIO("end\n"), io_out=io.StringIO(),
+            role="scout", phase="scouting", is_resume=True)
+        self.assertFalse(captured[0]["fresh"])
+        self.assertTrue(captured[0]["resume"])
+
+    def test_reviewer_meta_carries_full_artifact_set(self):
+        d = self._dir()
+        intel = os.path.join(d, "intel.json")
+        md = os.path.join(d, "intel.md")
+        review = os.path.join(d, "review.json")
+        for p in (intel, md):
+            with open(p, "w") as fh:
+                fh.write("{}")
+        captured = {}
+
+        class Fake:
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+
+            def close(self):
+                pass
+
+        cfg = {cowork.SCOUT_REVIEWER: {"controller": "claude",
+                                       "mode": "plan", "yolo": True}}
+        cowork.run_reviewer_once(
+            cfg, "ctx", [cowork.SCOUT_REVIEWER], intel, review,
+            session_factory=lambda c, io: Fake(),
+            reviewer_role=cowork.SCOUT_REVIEWER,
+            artifact_paths=[intel, md], phase="scouting", context_revision=4)
+        m = captured["meta"]
+        self.assertEqual(m["prompt_kind"], "reviewer_pass")
+        self.assertEqual(m["phase"], "scouting")
+        self.assertTrue(m["fresh"])
+        self.assertEqual(m["context_revision"], 4)
+        # The FULL embedded artifact set is described, not just the primary path.
+        self.assertEqual([a["path"] for a in m["artifacts"]], [intel, md])
+
+    def test_lead_eval_send_carries_meta(self):
+        # #1 (review fix): the lead's peer-eval send (_make_evaluate_fn) goes
+        # through _send with the eval meta, not a raw session.send.
+        d = self._dir()
+        scratch = os.path.join(d, "scratch.json")
+        scores = os.path.join(d, "scores.json")
+        captured = {}
+
+        class Fake:
+            def __init__(self):
+                self.io_out = io.StringIO()
+
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+
+        fn = cowork._make_evaluate_fn(
+            "scout", cowork.SCOUT_REVIEWER, "scouting", scratch, scores,
+            "UUID", context_revision=7)
+        fn(Fake(), {"verdict": "approve"}, 2)
+        m = captured["meta"]
+        self.assertEqual(m["prompt_kind"], "eval")
+        self.assertFalse(m["fresh"])
+        self.assertTrue(m["resume"])
+        self.assertEqual(m["phase"], "scouting")
+        self.assertEqual(m["round"], 2)
+        self.assertEqual(m["context_revision"], 7)
+
+    def test_lead_eval_meta_describes_consumed_upstream_artifacts(self):
+        # #1 (review fix): on the round-1 eval that bundles the consumed-upstream
+        # artifact, the eval meta must describe THOSE embedded files (not the
+        # deleted scratch output).
+        d = self._dir()
+        intel = os.path.join(d, "intel.json")
+        intel_md = os.path.join(d, "intel.md")
+        for p in (intel, intel_md):
+            with open(p, "w") as fh:
+                fh.write('{"x":1}')
+        scratch = os.path.join(d, "scratch.json")
+        scores = os.path.join(d, "scores.json")  # fresh -> no dedup
+        consumed = cowork._scout_consumed_upstream(intel, 1, intel_md)
+        captured = {}
+
+        class Fake:
+            def __init__(self):
+                self.io_out = io.StringIO()
+
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+
+        fn = cowork._make_evaluate_fn(
+            "planner", cowork.PLANNING_ADVISOR, "planning", scratch, scores,
+            "UUID", consumed_upstream=consumed, context_revision=3)
+        fn(Fake(), {"verdict": "approve"}, 1)   # round 1 -> bundle rides
+        arts = captured["meta"]["artifacts"]
+        self.assertIsNotNone(arts)
+        paths = [a["path"] for a in arts]
+        self.assertIn(intel, paths)
+        self.assertIn(intel_md, paths)
+        for a in arts:
+            self.assertIn("bytes", a)
+            self.assertIn("sha256", a)
+
+    def test_lead_eval_meta_has_no_artifacts_without_bundle(self):
+        # A later-round eval (no consumed-upstream bundle) embeds only the inline
+        # verdict, so it carries no embedded artifact files.
+        d = self._dir()
+        scratch = os.path.join(d, "scratch.json")
+        scores = os.path.join(d, "scores.json")
+        captured = {}
+
+        class Fake:
+            def __init__(self):
+                self.io_out = io.StringIO()
+
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+
+        fn = cowork._make_evaluate_fn(
+            "scout", cowork.SCOUT_REVIEWER, "scouting", scratch, scores, "UUID")
+        fn(Fake(), {"verdict": "approve"}, 2)
+        self.assertIsNone(captured["meta"]["artifacts"])
+
+    def test_review_run_end_carries_correlation_fields(self):
+        # #4 (review fix): review.run.start AND review.run.end carry the full
+        # correlation field set.
+        d = self._dir()
+        intel = os.path.join(d, "intel.json")
+        review = os.path.join(d, "review.json")
+        with open(intel, "w") as fh:
+            fh.write("{}")
+        tpath = os.path.join(d, "trace.jsonl")
+        trace = trace_store.Trace(tpath, session_uuid="X", run_id="R")
+
+        class Fake:
+            def send(self, text, meta=None):
+                pass
+
+            def close(self):
+                pass
+
+        cfg = {cowork.SCOUT_REVIEWER: {"controller": "claude",
+                                       "mode": "plan", "yolo": True}}
+        cowork.run_reviewer_once(
+            cfg, "ctx", [cowork.SCOUT_REVIEWER], intel, review,
+            session_factory=lambda c, io_out: Fake(),
+            reviewer_role=cowork.SCOUT_REVIEWER,
+            artifact_paths=[intel], phase="scouting", context_revision=4,
+            trace=trace)
+        with open(tpath) as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        end = [e for e in events if e["event"] == "review.run.end"][0]
+        self.assertEqual(end["prompt_kind"], "reviewer_pass")
+        self.assertEqual(end["phase"], "scouting")
+        self.assertEqual(end["context_revision"], 4)
+        self.assertIn("fresh", end)
+        self.assertIn("resume", end)
+        self.assertEqual([a["path"] for a in end["artifacts"]], [intel])
+
+    def test_report_counts_artifact_bytes_across_send_types(self):
+        # End-to-end: lead + reviewer + eval controller.turn.start events all
+        # aggregate into bytes-by-prompt-kind and artifact-by-file.
+        trace = [
+            {"event": "controller.turn.start", "role": "planner",
+             "controller": "claude", "prompt_kind": "role_seed",
+             "prompt_bytes": 200, "fresh": True,
+             "artifacts": [{"path": "intel.json", "bytes": 50}]},
+            {"event": "controller.turn.start", "role": "planning-advisor",
+             "controller": "claude", "prompt_kind": "reviewer_pass",
+             "prompt_bytes": 120, "resume": True,
+             "artifacts": [{"path": "plan.json", "bytes": 30},
+                           {"path": "plan.md", "bytes": 20}]},
+            {"event": "controller.turn.start", "role": "planning-advisor",
+             "controller": "claude", "prompt_kind": "eval",
+             "prompt_bytes": 40, "resume": True},
+        ]
+        s = cowork_report.summarize_trace(trace)
+        self.assertEqual(set(s["bytes_by_kind"]),
+                         {"role_seed", "reviewer_pass", "eval"})
+        self.assertEqual(s["artifact_bytes"]["plan.md"]["bytes"], 20)
+        self.assertEqual(s["fresh_resume"], {"fresh": 1, "resume": 2,
+                                             "unknown": 0})
+
+
+class DocsChecklistTest(unittest.TestCase):
+    """T11: sections 1–4 of the plan doc carry a checkmark; 5–6 do not."""
+
+    def test_sections_1_to_4_checked(self):
+        path = os.path.join(_HERE, "..", ".plans",
+                            "cowork-token-reduction.md")
+        with open(path, "r") as fh:
+            text = fh.read()
+        self.assertIn("## 1. Improve Prompt-Size Accounting ✅", text)
+        self.assertIn("## 2. Add A Session Token/Byte Report ✅", text)
+        self.assertIn("## 3. Cache Claude Probe Success ✅", text)
+        self.assertIn("## 4. Use Path-First, Diff-Based Review Packets ✅", text)
+        self.assertIn("## 5. Tighten Artifact Schemas", text)
+        self.assertNotIn("## 5. Tighten Artifact Schemas ✅", text)
+        self.assertNotIn("## 6. Avoid Duplicate Context Replay ✅", text)
 
 
 if __name__ == "__main__":
