@@ -41,6 +41,13 @@ DEFAULT_ROLE_PROMPT = "roles/scout.md"
 _Spinner = ui.Spinner
 
 
+def turn_result(ok=True, result="ok", **fields):
+    """Small structured send result consumed by the cowork orchestrator."""
+    out = {"ok": bool(ok), "result": result}
+    out.update({k: v for k, v in fields.items() if v is not None})
+    return out
+
+
 def _terminate(proc):
     """Best-effort: stop a spawned CLI so it is not left running after an
     interrupt. Tries SIGTERM, then SIGKILL."""
@@ -518,6 +525,7 @@ class ClaudeSession:
                  internal=False):
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
+        self.controller = "claude"
         self.label = speaker_label(speaker)
         # internal=True streams this whole session on the dim internal channel
         # (reviewer/advisor); role sessions stay False and mark inline blocks.
@@ -704,14 +712,36 @@ class ClaudeSession:
                     self.io_out.write(
                         ui.colorize("[error] " + (parsed.get("text") or ""),
                                     ui.RED, tty) + "\n")
+                    self.io_out.flush()
+                    return turn_result(
+                        False, "error", subtype=parsed.get("subtype"),
+                        session_id=sid or self.session_id)
                 elif self.trace:
                     self.trace.event("controller.turn.end", controller="claude",
-                                     role=self.speaker, result="ok",
+                                     role=self.speaker,
+                                     result="denied" if denied else "ok",
                                      subtype=parsed.get("subtype"),
                                      usage=parsed.get("usage"))
                 self.io_out.flush()
-                return
+                if denied:
+                    return turn_result(
+                        False, "denied", denied=True,
+                        subtype=parsed.get("subtype"),
+                        session_id=sid or self.session_id)
+                return turn_result(
+                    True, "ok", subtype=parsed.get("subtype"),
+                    session_id=sid or self.session_id)
             self.io_out.flush()
+        if spinner:
+            spinner.stop()
+        if region is not None:
+            region.__exit__(None, None, None)
+        if self.trace:
+            self.trace.event("controller.turn.end", controller="claude",
+                             role=self.speaker, result="error",
+                             error_type="eof")
+        return turn_result(False, "error", error_type="eof",
+                           session_id=self.session_id)
 
     def close(self):
         try:
@@ -730,6 +760,7 @@ class CodexSession:
                  extra_writable_dir=None, internal=False):
         self.mode = mode
         self.yolo = yolo
+        self.controller = "codex"
         self.io_out = io_out or sys.stdout
         self.speaker = speaker
         self.label = speaker_label(speaker)
@@ -818,7 +849,8 @@ class CodexSession:
                     self.trace.event("controller.turn.end", controller="codex",
                                      role=self.speaker, result="error",
                                      error_type="missing_thread_id")
-                return
+                return turn_result(False, "error",
+                                   error_type="missing_thread_id")
             command = build_codex_resume_command(
                 self.thread_id, text, self.mode, self.yolo,
                 extra_writable_dir=self.extra_writable_dir)
@@ -845,7 +877,7 @@ class CodexSession:
                 self.trace.event("controller.turn.end", controller="codex",
                                  role=self.speaker, result="error",
                                  error_type=type(exc).__name__)
-            raise
+            return turn_result(False, "error", error_type=type(exc).__name__)
         tid = capture_thread_id(events)
         if tid and not self.thread_id:
             self.thread_id = tid
@@ -873,6 +905,9 @@ class CodexSession:
                              role=self.speaker, result=result,
                              thread_id=self.thread_id, event_count=len(events),
                              usage=usage)
+        return turn_result(
+            result == "ok", result, denied=(result == "denied"),
+            thread_id=self.thread_id)
 
     def close(self):
         pass

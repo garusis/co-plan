@@ -101,6 +101,21 @@ DEFAULTS = {
     BUILD_REVIEWER: {"controller": "codex", "yolo": True, "mode": "implement"},
 }
 
+CONTROLLERS = ("claude", "codex")
+ROLE_PROMPT_PATHS = {
+    "scout": SCOUT_PROMPT_PATH,
+    SCOUT_REVIEWER: SCOUT_REVIEWER_PROMPT_PATH,
+    "planner": PLANNER_PROMPT_PATH,
+    PLANNING_ADVISOR: PLANNING_ADVISOR_PROMPT_PATH,
+    "builder": BUILDER_PROMPT_PATH,
+    BUILD_REVIEWER: BUILD_REVIEWER_PROMPT_PATH,
+}
+PHASE_LEADS = {"scouting": "scout", "planning": "planner",
+               "building": "builder"}
+PHASE_PAIRS = {"scouting": ("scout", SCOUT_REVIEWER),
+               "planning": ("planner", PLANNING_ADVISOR),
+               "building": ("builder", BUILD_REVIEWER)}
+
 
 # --------------------------------------------------------------------------- #
 # Menu seam (questionary): the interactive menus take injectable ask-callables  #
@@ -266,6 +281,22 @@ def resolve_context(args, resuming=False):
 # --------------------------------------------------------------------------- #
 
 
+def parse_switch_controller(value):
+    """Parse --switch-controller ROLE=CONTROLLER."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "--switch-controller must be ROLE=CONTROLLER")
+    role, controller = [p.strip() for p in value.split("=", 1)]
+    if role not in ROLES:
+        raise argparse.ArgumentTypeError(
+            "unknown role %r for --switch-controller" % role)
+    if controller not in CONTROLLERS:
+        raise argparse.ArgumentTypeError(
+            "unknown controller %r for --switch-controller "
+            "(expected claude or codex)" % controller)
+    return role, controller
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="cowork", add_help=True)
     p.add_argument("--check", action="store_true",
@@ -294,6 +325,10 @@ def build_parser():
     p.add_argument("--resume", action="store_true",
                    help="open the session picker for this directory (newest "
                         "first); needs an interactive terminal")
+    p.add_argument("--switch-controller", type=parse_switch_controller,
+                   metavar="ROLE=CONTROLLER",
+                   help="switch one current-phase role in an existing saved "
+                        "session to claude or codex, then continue")
     return p
 
 
@@ -527,14 +562,29 @@ def _send(session, text, meta=None):
     session's send() accepts it. Real bridge sessions do; test-injected fake
     sessions keep their historical `send(text)` signature and receive no meta,
     so the streaming/test contract stays byte-identical."""
-    if meta is not None:
-        try:
-            if "meta" in inspect.signature(session.send).parameters:
-                session.send(text, meta=meta)
-                return
-        except (ValueError, TypeError):
-            pass
-    session.send(text)
+    try:
+        if meta is not None:
+            try:
+                if "meta" in inspect.signature(session.send).parameters:
+                    result = session.send(text, meta=meta)
+                    return result or bridge.turn_result(True, "ok")
+            except (ValueError, TypeError):
+                pass
+        result = session.send(text)
+        if result is None:
+            return bridge.turn_result(True, "ok")
+        if isinstance(result, dict):
+            if "ok" not in result:
+                result = dict(result, ok=True)
+            if "result" not in result:
+                result = dict(result, result="ok" if result.get("ok") else "error")
+            return result
+        return bridge.turn_result(True, "ok")
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return bridge.turn_result(False, "error",
+                                  error_type=type(exc).__name__)
 
 
 def _artifact_descriptors(paths):
@@ -2059,17 +2109,19 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 extra_writable_dir=extra_writable_dir)
         else:
             spawn = claude_spawn or bridge._real_claude_spawn
-            ok, _alert = bridge.probe_claude_stream_json(
+            ok, alert = bridge.probe_claude_stream_json(
                 spawn, mode=cfg["mode"], yolo=cfg["yolo"],
                 role_prompt_file=prompt_path, trace=trace,
                 role=reviewer_role, extra_writable_dir=extra_writable_dir,
                 cache_enabled=True)
             if not ok:
-                verdict = state_store.read_review(review_path)
+                verdict = _controller_failure_verdict(
+                    {"ok": False, "result": "probe_failed"}, alert=alert)
                 if trace:
                     trace.event("review.run.end", role=reviewer_role,
                                 result="probe_failed",
-                                verdict=(verdict or {}).get("verdict"),
+                                verdict=None,
+                                controller_failure=True,
                                 prompt_kind="reviewer_pass", phase=phase,
                                 epoch=epoch, context_revision=context_revision,
                                 fresh=not bool(resume_id),
@@ -2088,7 +2140,23 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                 extra_writable_dir=extra_writable_dir)
         first = (brief + "\n\n" + ctx_block).strip()
         try:
-            _send(session, first, meta=review_meta)
+            send_result = _send(session, first, meta=review_meta)
+            if not send_result.get("ok", True):
+                verdict = _controller_failure_verdict(send_result)
+                if trace:
+                    trace.event(
+                        "review.run.end", role=reviewer_role,
+                        result="controller_failed",
+                        controller_result=send_result.get("result"),
+                        error_type=send_result.get("error_type"),
+                        subtype=send_result.get("subtype"),
+                        verdict=None,
+                        malformed=True,
+                        prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
+                        context_revision=context_revision,
+                        fresh=not bool(resume_id), resume=bool(resume_id),
+                        artifacts=_artifact_descriptors(meta_artifact_paths))
+                return verdict
             verdict = state_store.read_review(review_path)
             # The eval send must never reach the user even when the review turn
             # is surfaced: mute the session around it (D-eval-stays-muted).
@@ -2124,7 +2192,23 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
             internal=surface, resume_thread_id=resume_id, on_thread_id=cb,
             trace=trace, extra_writable_dir=extra_writable_dir)
     try:
-        _send(session, prompt, meta=review_meta)
+        send_result = _send(session, prompt, meta=review_meta)
+        if not send_result.get("ok", True):
+            verdict = _controller_failure_verdict(send_result)
+            if trace:
+                trace.event(
+                    "review.run.end", role=reviewer_role,
+                    result="controller_failed",
+                    controller_result=send_result.get("result"),
+                    error_type=send_result.get("error_type"),
+                    subtype=send_result.get("subtype"),
+                    verdict=None,
+                    malformed=True,
+                    prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
+                    context_revision=context_revision,
+                    fresh=not bool(resume_id), resume=bool(resume_id),
+                    artifacts=_artifact_descriptors(meta_artifact_paths))
+            return verdict
         verdict = state_store.read_review(review_path)
         # Keep the eval send muted even when the review turn is surfaced.
         with _muted_session(session) if surface else contextlib.nullcontext():
@@ -2367,6 +2451,11 @@ def _dissent_suffix(verdict):
 _STUCK_RETRY = object()
 _STUCK_INSPECT = object()
 _STUCK_END = object()
+_STUCK_SWITCH = object()
+
+_CTRL_RETRY = object()
+_CTRL_SWITCH = object()
+_CTRL_END = object()
 
 
 def _repair_prompt(artifact_noun):
@@ -2391,9 +2480,21 @@ def _stuck_gate_text(status_path, role, enabled=False):
     return (
         "the %s appears stuck — it reopened work but its status file did not "
         "change across an automatic repair attempt.\n  status file: %s\n"
-        "choose: retry (run it once more), inspect (show the status file), or "
+        "choose: retry (run it once more), switch-controller (move this role "
+        "to the alternate controller), inspect (show the status file), or "
         "end (end this phase cleanly)." % (role, ui.render_path(
             status_path, enabled)))
+
+
+def _controller_failure_text(role, controller, reason, alert=None):
+    text = (
+        "the %s controller for %s cannot make progress (%s).\n"
+        "choose: retry (try %s again), switch-controller (move this role to "
+        "the alternate controller), or end (end this phase cleanly)."
+        % (controller, role, reason, controller))
+    if alert:
+        text += "\n\n" + str(alert)
+    return text
 
 
 def _emit_stuck_inspect(io_out, status_path):
@@ -2425,17 +2526,44 @@ def _read_stuck_gate(io_in, io_out):
         choice = ui.select(
             "The role reopened work but didn't update its status — what now?",
             [("retry", "Run it once more"),
+             ("switch-controller", "Move this role to the alternate controller"),
              ("inspect", "Show the status file"),
              ("end", "End this phase")])
         return {"retry": _STUCK_RETRY, "inspect": _STUCK_INSPECT,
+                "switch-controller": _STUCK_SWITCH,
                 "end": _STUCK_END}.get(choice, _STUCK_END)
     line = io_in.readline()
     token = line.strip().lower()
     if token == "retry":
         return _STUCK_RETRY
+    if token in ("switch", "switch-controller"):
+        return _STUCK_SWITCH
     if token == "inspect":
         return _STUCK_INSPECT
     return _STUCK_END
+
+
+def _read_controller_failure_gate(io_in, io_out):
+    """Read the controller-failure gate choice.
+
+    Off a TTY, only explicit retry/switch tokens continue; blank/EOF keeps the
+    historical safe terminating behavior.
+    """
+    if ui.is_tty(io_in) and ui.is_tty(io_out):
+        choice = ui.select(
+            "The controller cannot continue — what now?",
+            [("retry", "Try the same controller again"),
+             ("switch-controller", "Move this role to the alternate controller"),
+             ("end", "End this phase")])
+        return {"retry": _CTRL_RETRY, "switch-controller": _CTRL_SWITCH,
+                "end": _CTRL_END}.get(choice, _CTRL_END)
+    line = io_in.readline()
+    token = line.strip().lower()
+    if token == "retry":
+        return _CTRL_RETRY
+    if token in ("switch", "switch-controller"):
+        return _CTRL_SWITCH
+    return _CTRL_END
 
 
 # Returned by the reviewer-failure gate reader (the visible escalation shown when
@@ -2446,6 +2574,7 @@ def _read_stuck_gate(io_in, io_out):
 _REVFAIL_RETRY = object()
 _REVFAIL_SKIP = object()
 _REVFAIL_END = object()
+_REVFAIL_SWITCH = object()
 
 
 def _is_review_failure(verdict):
@@ -2474,15 +2603,28 @@ def _is_review_failure(verdict):
     return False
 
 
-def _reviewer_fail_gate_text(reviewer_role, role):
+def _reviewer_fail_gate_text(reviewer_role, role, detail=None):
     """The banner shown at the visible reviewer-failure gate."""
-    return (
+    text = (
         "the %s could not return a usable verdict (account limit, crash, or an "
         "empty/garbled write) across %d tries — it is not reviewing the %s's "
         "work.\nchoose: retry (run the reviewer once more), skip-review (stop "
         "reviewing for the rest of this phase and go straight to the approve/"
-        "revise gate), or end (end this phase cleanly)."
+        "revise gate), switch-controller (move the reviewer to the alternate "
+        "controller), or end (end this phase cleanly)."
         % (reviewer_role, REVIEW_FAIL_CAP, role))
+    if detail:
+        text += "\n\n" + str(detail)
+    return text
+
+
+def _controller_failure_verdict(send_result=None, alert=None):
+    out = {"malformed": True, "controller_failure": True}
+    if send_result:
+        out["controller_failure_result"] = dict(send_result)
+    if alert:
+        out["controller_failure_alert"] = alert
+    return out
 
 
 def _read_reviewer_fail_gate(io_in, io_out):
@@ -2499,13 +2641,17 @@ def _read_reviewer_fail_gate(io_in, io_out):
             "The reviewer isn't returning a usable verdict — what now?",
             [("retry", "Run the reviewer once more"),
              ("skip-review", "Skip review for this phase — go to approve/revise"),
+             ("switch-controller", "Move the reviewer to the alternate controller"),
              ("end", "End this phase")])
         return {"retry": _REVFAIL_RETRY, "skip-review": _REVFAIL_SKIP,
+                "switch-controller": _REVFAIL_SWITCH,
                 "end": _REVFAIL_END}.get(choice, _REVFAIL_SKIP)
     line = io_in.readline()
     token = line.strip().lower()
     if token == "retry":
         return _REVFAIL_RETRY
+    if token in ("switch", "switch-controller"):
+        return _REVFAIL_SWITCH
     if token == "end":
         return _REVFAIL_END
     return _REVFAIL_SKIP
@@ -2534,7 +2680,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                handoff_confirm_prompt="Hand the work back to the scout?",
                handoff_declined_text_fn=handoff_declined_text,
                evaluate_fn=None, skip_baseline=None, context_revision=None,
-               phase=None, is_resume=False, seed_artifact_paths=None):
+               phase=None, is_resume=False, seed_artifact_paths=None,
+               on_first_send_accepted=None):
     """Drive a user-facing role's per-turn loop: send → read status → prompt,
     gate, or finish. Role-generic: the scout and the planner both run on this
     loop, differing only in banners, status file, paired reviewer, and whether
@@ -2546,6 +2693,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
       - "interrupted": Ctrl-C.
       - "handoff": the role signaled `handoff_back` with a payload and the
         user CONFIRMED the gate; `payload` carries the handoff note.
+      - "switch_controller": a recovery gate asked the caller to switch the
+        active role; `payload` carries role/reason/pending-turn metadata.
 
     A blank line re-prompts. When `review_fn` is provided (the paired reviewer
     is on the team), each `ready_for_review` first runs the reviewer (topology
@@ -2658,14 +2807,65 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                             context_revision=context_revision,
                             artifacts=lead_meta["artifacts"],
                             **trace_store.prompt_meta(pending))
-            _send(session, pending, meta=lead_meta)
+            send_result = _send(session, pending, meta=lead_meta)
             if trace:
-                trace.event("role.send.end", role=role)
+                trace.event("role.send.end", role=role,
+                            ok=bool(send_result.get("ok", True)),
+                            result=send_result.get("result"),
+                            error_type=send_result.get("error_type"),
+                            subtype=send_result.get("subtype"))
             fp_after = state_store.fingerprint_status(status_path)
             if trace:
                 trace.event("role.fingerprint.after", role=role,
                             status=fp_after["status"], sha256=fp_after["sha256"],
                             size=fp_after["size"], exists=fp_after["exists"])
+            if (not send_result.get("ok", True)
+                    and fp_after["sha256"] == fp_before["sha256"]):
+                if trace:
+                    trace.event("controller.failure", role=role, phase=phase,
+                                reason="send_failed",
+                                result=send_result.get("result"),
+                                error_type=send_result.get("error_type"),
+                                subtype=send_result.get("subtype"),
+                                artifact_progress=False)
+                while True:
+                    ui.banner(io_out, _controller_failure_text(
+                        role, getattr(session, "controller", "configured"),
+                        send_result.get("error_type")
+                        or send_result.get("subtype")
+                        or send_result.get("result") or "send failed"),
+                        "dissent")
+                    action = _read_controller_failure_gate(io_in, io_out)
+                    if action is _CTRL_RETRY:
+                        if trace:
+                            trace.event("user.action", role=role,
+                                        action="controller_failure_retry")
+                        break
+                    if action is _CTRL_SWITCH:
+                        if trace:
+                            trace.event("user.action", role=role,
+                                        action="controller_failure_switch")
+                        outcome_kind = "switch_controller"
+                        payload = {
+                            "role": role,
+                            "reason": "send_failed",
+                            "pending": pending,
+                            "prompt_kind": lead_kind,
+                            "result": dict(send_result),
+                        }
+                        break
+                    if trace:
+                        trace.event("user.action", role=role,
+                                    action="controller_failure_end")
+                    outcome_kind = "ended"
+                    break
+                if outcome_kind in ("switch_controller", "ended"):
+                    break
+                continue
+            if (first_send and send_result.get("ok", True)
+                    and on_first_send_accepted):
+                on_first_send_accepted()
+                on_first_send_accepted = None
             # Stale-no-op detection: a reopened (or in-repair) turn that left the
             # status file byte-identical made no progress. Both-missing
             # (None == None) also counts as a no-op — the role never wrote.
@@ -2718,6 +2918,18 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                     pending = _repair_prompt(artifact_noun)
                     in_repair = True  # re-checked; re-shows gate if still stuck
                     continue
+                if gate_decision is _STUCK_SWITCH:
+                    if trace:
+                        trace.event("user.action", role=role,
+                                    action="stuck_switch")
+                    outcome_kind = "switch_controller"
+                    payload = {
+                        "role": role,
+                        "reason": "stuck",
+                        "pending": _repair_prompt(artifact_noun),
+                        "prompt_kind": "repair",
+                    }
+                    break
                 # _STUCK_END: end this phase cleanly, like EOF.
                 if trace:
                     trace.event("user.action", role=role, action="stuck_end")
@@ -2852,7 +3064,9 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 force_full_reread = True  # D8: retry full-reread
                                 continue
                             ui.banner(io_out, _reviewer_fail_gate_text(
-                                reviewer_role, role), "dissent")
+                                reviewer_role, role,
+                                verdict.get("controller_failure_alert")),
+                                "dissent")
                             decision = _read_reviewer_fail_gate(io_in, io_out)
                             if decision is _REVFAIL_RETRY:
                                 # Re-run the reviewer, SAME round, counter kept —
@@ -2871,6 +3085,28 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                                 skip_review = True
                                 review_failures = 0
                                 break
+                            if decision is _REVFAIL_SWITCH:
+                                switcher = getattr(
+                                    review_fn, "switch_controller", None)
+                                if switcher and switcher(
+                                        reason="reviewer_failure"):
+                                    if trace:
+                                        trace.event(
+                                            "user.action", role=role,
+                                            reviewer_role=reviewer_role,
+                                            action="review_fail_switch")
+                                    force_full_reread = True
+                                    review_failures = 0
+                                    continue
+                                if trace:
+                                    trace.event(
+                                        "user.action", role=role,
+                                        reviewer_role=reviewer_role,
+                                        action="review_fail_switch_failed")
+                                # Re-show the failure gate if the switch could
+                                # not be committed (for example the alternate
+                                # CLI is missing).
+                                continue
                             # _REVFAIL_END: end this phase cleanly, like EOF.
                             if trace:
                                 trace.event("user.action", role=role,
@@ -3021,7 +3257,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
 def _scout_loop(session, first, intel_path, context, io_in, io_out,
                 review_fn=None, trace=None, on_outcome=None,
                 evaluate_fn=None, intel_md_path=None, skip_baseline=None,
-                context_revision=None, is_resume=False):
+                context_revision=None, is_resume=False,
+                on_first_send_accepted=None):
     """The scout instantiation of `_role_loop` (kept as the historical entry
     point). Returns 0; the loop outcome is reported via `on_outcome` so
     `run_flow` can chain into the planning phase on approval.
@@ -3040,10 +3277,20 @@ def _scout_loop(session, first, intel_path, context, io_in, io_out,
             lambda _p, en=False: scout_review_text(intel_md_path, en))
         loop_kwargs["done_text"] = (
             lambda _p, en=False: scout_done_text(intel_md_path, en))
-    rc, outcome, _payload = _role_loop(
-        session, first, intel_path, context, io_in, io_out, **loop_kwargs)
+    rc, outcome, payload = _role_loop(
+        session, first, intel_path, context, io_in, io_out,
+        on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
     if on_outcome:
-        on_outcome(outcome)
+        try:
+            params = inspect.signature(on_outcome).parameters
+            if (len(params) >= 2
+                    or any(p.kind == p.VAR_POSITIONAL
+                           for p in params.values())):
+                on_outcome(outcome, payload)
+            else:
+                on_outcome(outcome)
+        except (ValueError, TypeError):
+            on_outcome(outcome)
     return rc
 
 
@@ -3055,7 +3302,9 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                    session_uuid=None, intel_path=None, planning_epoch=None,
                    consumed_upstream=None, extra_writable_dir=None,
                    surface_io_out=None, intel_md_path=None,
-                   review_packet_ctx=None):
+                   review_packet_ctx=None, switch_controller_fn=None,
+                   switch_note_fn=None, on_switch_consumed=None,
+                   reviewer_controller_check_fn=None):
     """Build the `review_fn` passed to `_role_loop` when the paired reviewer
     (`reviewer_role`, default scout-reviewer) is on the team, or None when it is
     not. The closure runs one reviewer pass and returns its verdict dict.
@@ -3098,9 +3347,24 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
     holder = {"resume_id": reviewer_resume_id,
               "context_update": context_update,
               "ack": on_context_ack,
-              "consumed_done": consumed_upstream is None}
+              "consumed_done": consumed_upstream is None,
+              "switch_note": None}
 
     def review_fn(artifact_path, round_index, force_full_reread=False):
+        if holder["switch_note"] is None and switch_note_fn:
+            holder["switch_note"] = switch_note_fn(reviewer_role)
+        runner_context = context
+        if holder["switch_note"]:
+            runner_context = (holder["switch_note"] + "\n\n"
+                              + (runner_context or "")).strip()
+        if reviewer_controller_check_fn:
+            alerts = reviewer_controller_check_fn(reviewer_role)
+            if alerts:
+                return _controller_failure_verdict(
+                    {"ok": False, "result": "missing_executable",
+                     "error_type": "missing_executable"},
+                    alert="\n".join(alerts))
+
         def capture(controller, sid):
             if sid:
                 holder["resume_id"] = sid
@@ -3177,8 +3441,8 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
                     specs.append(spec)
             kwargs["eval_scratch_path"] = eval_scratch_path
             kwargs["eval_specs"] = specs
-        verdict = runner(config, context, selected, artifact_path, review_path,
-                         **kwargs)
+        verdict = runner(config, runner_context, selected, artifact_path,
+                         review_path, **kwargs)
         if specs:
             if len(specs) > 1:
                 holder["consumed_done"] = True
@@ -3194,7 +3458,26 @@ def make_review_fn(config, context, selected, review_path, reviewer_runner=None,
             if holder["ack"]:
                 holder["ack"]()
                 holder["ack"] = None
+            if holder["switch_note"] and not _is_review_failure(verdict):
+                if on_switch_consumed:
+                    on_switch_consumed(reviewer_role)
+                holder["switch_note"] = None
         return verdict
+
+    def switch_review_controller(reason="reviewer_failure"):
+        if not switch_controller_fn:
+            return False
+        ok = switch_controller_fn(reviewer_role, reason=reason, source="gate")
+        if not ok:
+            return False
+        holder["resume_id"] = None
+        holder["context_update"] = None
+        holder["ack"] = None
+        holder["switch_note"] = switch_note_fn(
+            reviewer_role) if switch_note_fn else None
+        return True
+
+    review_fn.switch_controller = switch_review_controller
 
     return review_fn
 
@@ -3208,7 +3491,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
               trace=None, on_outcome=None,
               eval_scratch_path=None, reviewer_eval_scratch_path=None,
               scores_path=None, session_uuid=None, intel_md_path=None,
-              skip_baseline=None, review_packet_ctx=None):
+              skip_baseline=None, review_packet_ctx=None,
+              switch_controller_fn=None, reviewer_switch_note_fn=None,
+              on_reviewer_switch_consumed=None,
+              on_first_send_accepted=None,
+              reviewer_controller_check_fn=None):
     """Spin up the scout's CLI and drive the review loop.
 
     `resume_id` continues a saved CLI session; `on_session(controller, id)` is
@@ -3255,7 +3542,11 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
         extra_writable_dir=sessions_dir, surface_io_out=io_out,
-        review_packet_ctx=review_packet_ctx)
+        review_packet_ctx=review_packet_ctx,
+        switch_controller_fn=switch_controller_fn,
+        switch_note_fn=reviewer_switch_note_fn,
+        on_switch_consumed=on_reviewer_switch_consumed,
+        reviewer_controller_check_fn=reviewer_controller_check_fn)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -3297,14 +3588,26 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
             if on_session:
                 on_session("claude", session_id)
         cb = (lambda i: on_session("claude", i)) if on_session else None
-        if session_factory:
-            session = session_factory("claude", session_id=session_id,
-                                      resume_id=rid, on_session_id=cb)
-        else:
-            session = bridge.ClaudeSession(
-                SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
-                speaker="scout", session_id=session_id, resume_id=rid,
-                on_session_id=cb, trace=trace, extra_writable_dir=sessions_dir)
+        try:
+            if session_factory:
+                session = session_factory("claude", session_id=session_id,
+                                          resume_id=rid, on_session_id=cb)
+            else:
+                session = bridge.ClaudeSession(
+                    SCOUT_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
+                    speaker="scout", session_id=session_id, resume_id=rid,
+                    on_session_id=cb, trace=trace,
+                    extra_writable_dir=sessions_dir)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.event("role.end", role="scout", result="start_failed",
+                            error_type=type(exc).__name__)
+            io_out.write("cowork: failed to start scout controller: %s\n"
+                         % type(exc).__name__)
+            io_out.flush()
+            return 1
         first = (brief + "\n\n" + context).strip()
         return _scout_loop(session, first, intel_path, context, io_in, io_out,
                            review_fn=review_fn, trace=trace,
@@ -3313,7 +3616,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                            skip_baseline=skip_baseline,
                            context_revision=(review_packet_ctx or {}).get(
                                "context_revision"),
-                           is_resume=bool(resume_id))
+                           is_resume=bool(resume_id),
+                           on_first_send_accepted=on_first_send_accepted)
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
@@ -3334,7 +3638,8 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
                        skip_baseline=skip_baseline,
                        context_revision=(review_packet_ctx or {}).get(
                            "context_revision"),
-                       is_resume=bool(resume_id))
+                       is_resume=bool(resume_id),
+                       on_first_send_accepted=on_first_send_accepted)
 
 
 def run_planner(config, context, selected, io_in=None, io_out=None,
@@ -3348,7 +3653,11 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
                 eval_scratch_path=None, reviewer_eval_scratch_path=None,
                 scores_path=None, session_uuid=None, intel_path=None,
                 planning_epoch=None, skip_baseline=None, intel_md_path=None,
-                review_packet_ctx=None):
+                review_packet_ctx=None, switch_controller_fn=None,
+                reviewer_switch_note_fn=None,
+                on_reviewer_switch_consumed=None,
+                on_first_send_accepted=None,
+                reviewer_controller_check_fn=None):
     """Spin up the planner's CLI and drive the planning loop (the planner
     instantiation of `_role_loop`).
 
@@ -3388,7 +3697,11 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
         intel_path=intel_path, planning_epoch=planning_epoch,
         intel_md_path=intel_md_path,
         extra_writable_dir=sessions_dir, surface_io_out=io_out,
-        review_packet_ctx=review_packet_ctx)
+        review_packet_ctx=review_packet_ctx,
+        switch_controller_fn=switch_controller_fn,
+        switch_note_fn=reviewer_switch_note_fn,
+        on_switch_consumed=on_reviewer_switch_consumed,
+        reviewer_controller_check_fn=reviewer_controller_check_fn)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -3452,18 +3765,31 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             if on_session:
                 on_session("claude", session_id)
         cb = (lambda i: on_session("claude", i)) if on_session else None
-        if session_factory:
-            session = session_factory("claude", session_id=session_id,
-                                      resume_id=rid, on_session_id=cb)
-        else:
-            session = bridge.ClaudeSession(
-                PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
-                speaker="planner", session_id=session_id, resume_id=rid,
-                on_session_id=cb, trace=trace, extra_writable_dir=sessions_dir)
+        try:
+            if session_factory:
+                session = session_factory("claude", session_id=session_id,
+                                          resume_id=rid, on_session_id=cb)
+            else:
+                session = bridge.ClaudeSession(
+                    PLANNER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
+                    speaker="planner", session_id=session_id, resume_id=rid,
+                    on_session_id=cb, trace=trace,
+                    extra_writable_dir=sessions_dir)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.event("role.end", role="planner", result="start_failed",
+                            error_type=type(exc).__name__)
+            io_out.write("cowork: failed to start planner controller: %s\n"
+                         % type(exc).__name__)
+            io_out.flush()
+            report("ended", None)
+            return 1
         first = (brief + "\n\n" + context).strip()
         rc, outcome, payload = _role_loop(
             session, first, plan_json_path, context, io_in, io_out,
-            **loop_kwargs)
+            on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
         report(outcome, payload)
         return rc
 
@@ -3482,7 +3808,8 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
             resume_thread_id=resume_id, on_thread_id=cb, trace=trace,
             extra_writable_dir=sessions_dir)
     rc, outcome, payload = _role_loop(
-        session, prompt, plan_json_path, context, io_in, io_out, **loop_kwargs)
+        session, prompt, plan_json_path, context, io_in, io_out,
+        on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
     report(outcome, payload)
     return rc
 
@@ -3499,7 +3826,11 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
                 scores_path=None, session_uuid=None, plan_json_path=None,
                 plan_md_path=None, building_epoch=None, baseline_note="",
                 baseline_repos=None, build_summary_path=None,
-                review_packet_ctx=None):
+                review_packet_ctx=None, switch_controller_fn=None,
+                reviewer_switch_note_fn=None,
+                on_reviewer_switch_consumed=None,
+                on_first_send_accepted=None,
+                reviewer_controller_check_fn=None):
     """Spin up the builder's CLI and drive the building loop (the builder
     instantiation of `_role_loop`).
 
@@ -3542,7 +3873,11 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
         eval_scratch_path=reviewer_eval_scratch_path,
         scores_path=scores_path, session_uuid=session_uuid,
         consumed_upstream=consumed, extra_writable_dir=sessions_dir,
-        surface_io_out=io_out, review_packet_ctx=review_packet_ctx)
+        surface_io_out=io_out, review_packet_ctx=review_packet_ctx,
+        switch_controller_fn=switch_controller_fn,
+        switch_note_fn=reviewer_switch_note_fn,
+        on_switch_consumed=on_reviewer_switch_consumed,
+        reviewer_controller_check_fn=reviewer_controller_check_fn)
     evaluate_fn = None
     if review_fn is not None:
         evaluate_fn = _make_evaluate_fn(
@@ -3611,18 +3946,31 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             if on_session:
                 on_session("claude", session_id)
         cb = (lambda i: on_session("claude", i)) if on_session else None
-        if session_factory:
-            session = session_factory("claude", session_id=session_id,
-                                      resume_id=rid, on_session_id=cb)
-        else:
-            session = bridge.ClaudeSession(
-                BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
-                speaker="builder", session_id=session_id, resume_id=rid,
-                on_session_id=cb, trace=trace, extra_writable_dir=sessions_dir)
+        try:
+            if session_factory:
+                session = session_factory("claude", session_id=session_id,
+                                          resume_id=rid, on_session_id=cb)
+            else:
+                session = bridge.ClaudeSession(
+                    BUILDER_PROMPT_PATH, cfg["mode"], cfg["yolo"], io_out=io_out,
+                    speaker="builder", session_id=session_id, resume_id=rid,
+                    on_session_id=cb, trace=trace,
+                    extra_writable_dir=sessions_dir)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.event("role.end", role="builder", result="start_failed",
+                            error_type=type(exc).__name__)
+            io_out.write("cowork: failed to start builder controller: %s\n"
+                         % type(exc).__name__)
+            io_out.flush()
+            report("ended", None)
+            return 1
         first = (brief + "\n\n" + context).strip()
         rc, outcome, payload = _role_loop(
             session, first, build_status_path, context, io_in, io_out,
-            **loop_kwargs)
+            on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
         report(outcome, payload)
         return rc
 
@@ -3642,7 +3990,7 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
             extra_writable_dir=sessions_dir)
     rc, outcome, payload = _role_loop(
         session, prompt, build_status_path, context, io_in, io_out,
-        **loop_kwargs)
+        on_first_send_accepted=on_first_send_accepted, **loop_kwargs)
     report(outcome, payload)
     return rc
 
@@ -3709,6 +4057,61 @@ def select_session(args, io_in, io_out, select_fn=None, now=None):
             error="--resume cannot be combined with --no-session "
                   "(there is no session to resume).")
 
+    if args.switch_controller:
+        if args.no_session:
+            return SessionChoice(
+                error="--switch-controller cannot be combined with --no-session "
+                      "(it must update an existing saved session).")
+        if args.new:
+            return SessionChoice(
+                error="--switch-controller cannot be combined with --new "
+                      "(it must update an existing saved session).")
+        if args.team:
+            return SessionChoice(
+                error="--switch-controller cannot be combined with --team "
+                      "(it reuses the saved team).")
+        if args.config:
+            return SessionChoice(
+                error="--switch-controller cannot be combined with --config "
+                      "(it reuses the saved role config).")
+
+        cwd = os.getcwd()
+        interactive_picker_ok = ui.is_tty(io_in) and ui.is_tty(io_out)
+        if args.session_file:
+            if not os.path.exists(args.session_file):
+                return SessionChoice(
+                    error="--switch-controller: session file does not exist: %s"
+                          % args.session_file)
+            return SessionChoice(path=args.session_file)
+
+        discovered = state_store.list_sessions(cwd)
+        if not discovered:
+            return SessionChoice(
+                error="--switch-controller: no saved sessions found in %s."
+                      % state_store.session_dir(cwd))
+
+        def run_picker():
+            choices = [(row["path"], _session_picker_label(row, now))
+                       for row in discovered]
+            chosen = select_fn("Switch controller in which session?", choices)
+            if not chosen:
+                return SessionChoice(cancelled=True)
+            return SessionChoice(path=chosen)
+
+        if args.resume:
+            if not interactive_picker_ok:
+                return SessionChoice(
+                    error="--resume with --switch-controller needs an "
+                          "interactive terminal; use --session-file instead.")
+            return run_picker()
+        if len(discovered) == 1:
+            return SessionChoice(path=discovered[0]["path"])
+        if interactive_picker_ok:
+            return run_picker()
+        return SessionChoice(
+            error="--switch-controller found multiple saved sessions; pass "
+                  "--session-file to choose one.")
+
     # 2. --no-session: not cancelled, not error — the flow still runs with an
     # ephemeral session; the path is computed exactly as today but never read or
     # written because session_enabled stays False downstream.
@@ -3773,6 +4176,74 @@ def select_session(args, io_in, io_out, select_fn=None, now=None):
     return SessionChoice(cancelled=True)  # menu dismissed
 
 
+def effective_phase_for(state, selected):
+    """Apply the persisted phase fallback rules for the saved team."""
+    phase = state_store.get_phase(state)
+    planner_on_team = "planner" in selected
+    builder_on_team = "builder" in selected
+    if phase == "building" and not builder_on_team:
+        phase = "planning"
+    if phase == "planning" and not planner_on_team:
+        phase = "scouting"
+    return phase
+
+
+def alternate_controller(controller):
+    return "codex" if controller == "claude" else "claude"
+
+
+def validate_switch_role(role, target, phase, selected, state):
+    if not state_store.has_config(state):
+        return "--switch-controller requires a saved session with saved team/config."
+    if role not in selected:
+        return "role %r is not on the saved team." % role
+    if role not in PHASE_PAIRS.get(phase, ()):
+        return (
+            "role %r is not switchable in the current %s phase; choose one of: %s."
+            % (role, phase, ", ".join(PHASE_PAIRS.get(phase, ()))))
+    if target not in CONTROLLERS:
+        return "controller must be claude or codex."
+    return None
+
+
+def switch_handoff_packet(role, phase, pending_switch, artifact_paths=None,
+                          shared_context="", pending_turn=None):
+    """Fresh-provider handoff text prepended to a switched role/reviewer."""
+    if not pending_switch:
+        return ""
+    from_controller = pending_switch.get("from_controller") or "unknown"
+    to_controller = pending_switch.get("to_controller") or "unknown"
+    lines = [
+        "[controller switch handoff]",
+        "You are continuing an existing cowork %s phase as %s." % (phase, role),
+        "Controller switched: %s -> %s." % (from_controller, to_controller),
+        "This is a fresh %s provider conversation. Hidden chat history from %s "
+        "is not available; cowork-visible session state, artifacts, shared "
+        "context, and the working tree continue." % (to_controller, from_controller),
+    ]
+    if pending_switch.get("reason"):
+        lines.append("Switch reason: %s." % pending_switch.get("reason"))
+    if pending_switch.get("source"):
+        lines.append("Switch source: %s." % pending_switch.get("source"))
+    if shared_context:
+        lines.extend(["", "<shared_context>", shared_context.strip(),
+                      "</shared_context>"])
+    for path in artifact_paths or []:
+        if not path:
+            continue
+        lines.extend(["", "<artifact path=%r>" % path, _read_text(path),
+                      "</artifact>"])
+    if pending_turn:
+        lines.extend([
+            "",
+            "<failed_pending_turn>",
+            pending_turn.strip(),
+            "</failed_pending_turn>",
+            "Process the failed pending turn above after orienting yourself.",
+        ])
+    return "\n".join(lines).strip()
+
+
 def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
              run_planner_fn=None, run_builder_fn=None):
     io_in = io_in or sys.stdin
@@ -3810,6 +4281,30 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         return 0
     spath = choice.path
     saved = state_store.load(spath) if session_enabled else None
+    if args.switch_controller and session_enabled:
+        reason = None
+        message = None
+        if saved is None:
+            reason = "switch_controller_unloadable_session"
+            message = (
+                "--switch-controller: session file is not a loadable cowork "
+                "session: %s" % spath)
+        elif not state_store.has_config(saved):
+            reason = "switch_controller_missing_config"
+            message = (
+                "--switch-controller requires a saved session with saved "
+                "team/config.")
+        if message:
+            eph_uuid = (state_store.get_session_uuid(saved)
+                        if isinstance(saved, dict)
+                        and state_store.get_session_uuid(saved)
+                        else str(uuid.uuid4()))
+            etrace = trace_store.Trace(
+                trace_store.trace_path_for(eph_uuid),
+                session_uuid=eph_uuid, enabled=True)
+            etrace.event("run.end", rc=2, reason=reason)
+            io_out.write("cowork: " + message + "\n")
+            return 2
     # cowork session UUID (distinct from any claude/codex session id): names this
     # session's assets, e.g. the scout intel file. On a New path, reuse the uuid
     # select_session minted into the filename so the filename uuid, the internal
@@ -3869,11 +4364,13 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     if session_enabled and not reuse_config:
         saved = state_store.save_config(spath, selected, config, prior=saved or {})
 
-    # Preflight (rich/prompt_toolkit/questionary required only for interactive use).
+    # Global preflight (Python + interactive UI packages only). Controller
+    # executables are checked on-demand when each role is about to launch, so a
+    # missing active controller can reach the switch-controller recovery gate.
     kwargs = {"interactive": interactive}
     if which is not None:
         kwargs["which"] = which
-    ok, alerts = preflight.preflight(config, **kwargs)
+    ok, alerts = preflight.preflight({}, **kwargs)
     trace.event("preflight.result", ok=ok, alerts_count=len(alerts))
     if not ok:
         trace.event("run.end", rc=1, reason="preflight_failed")
@@ -3887,13 +4384,9 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
     # falls back when the resumed phase's lead role is not on the team: a
     # `building` phase without a builder falls back to planning; a `planning`
     # phase without a planner falls back to scouting.
-    phase = state_store.get_phase(saved) if session_enabled else "scouting"
+    phase = effective_phase_for(saved, selected) if session_enabled else "scouting"
     planner_on_team = "planner" in selected
     builder_on_team = "builder" in selected
-    if phase == "building" and not builder_on_team:
-        phase = "planning"
-    if phase == "planning" and not planner_on_team:
-        phase = "scouting"
     if phase == "scouting" and "scout" not in selected:
         trace.event("run.end", rc=0, reason="scout_not_selected")
         if planner_on_team:
@@ -3937,10 +4430,169 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                         controller=controller, session_id=sid)
         return on_sess
 
+    pending_switches = {}
+    pending_switch_turns = {}
+
+    def check_controller_tool(controller):
+        return preflight.check_tools(
+            [controller], which=which if which is not None else shutil.which)
+
+    def reviewer_controller_check(role):
+        if role not in config:
+            return None
+        controller = config[role].get("controller")
+        ok, alerts = check_controller_tool(controller)
+        if ok:
+            return None
+        trace.event("review.controller_preflight_failed", role=role,
+                    phase=phase, controller=controller,
+                    alerts_count=len(alerts))
+        return alerts
+
+    def switch_controller(role, reason=None, target=None, source="gate"):
+        if role not in config:
+            io_out.write("cowork: cannot switch %s — role is not configured.\n"
+                         % role)
+            return False
+        current = config[role].get("controller")
+        target = target or alternate_controller(current)
+        trace.event("controller.switch.request", role=role, phase=phase,
+                    source=source, reason=reason, from_controller=current,
+                    to_controller=target)
+        if target == current:
+            io_out.write("cowork: %s is already using %s.\n" % (role, target))
+            trace.event("controller.switch.end", role=role, phase=phase,
+                        result="already_current", controller=target)
+            return False
+        ok, alerts = check_controller_tool(target)
+        if not ok:
+            trace.event("controller.switch.preflight_failed", role=role,
+                        phase=phase, target_controller=target,
+                        alerts_count=len(alerts))
+            io_out.write("cowork: cannot switch %s to %s yet:\n" % (role, target))
+            for alert in alerts:
+                io_out.write("  - " + alert + "\n")
+            io_out.flush()
+            return False
+        if target == "claude":
+            cfg = dict(config[role])
+            prompt_path = ROLE_PROMPT_PATHS.get(role)
+            ok, alert = _with_status_spinner(
+                io_out, "checking claude for %s" % role,
+                lambda: bridge.probe_claude_stream_json(
+                    bridge._real_claude_spawn, mode=cfg["mode"],
+                    yolo=cfg["yolo"], role_prompt_file=prompt_path,
+                    trace=trace, role=role,
+                    extra_writable_dir=state_store.session_assets_dir(
+                        session_uuid),
+                    cache_enabled=True))
+            if not ok:
+                trace.event("controller.switch.probe_failed", role=role,
+                            phase=phase, target_controller=target)
+                io_out.write("cowork: cannot switch %s to claude: %s\n"
+                             % (role, alert))
+                io_out.flush()
+                return False
+        entry = {
+            "from_controller": current,
+            "to_controller": target,
+            "reason": reason,
+            "source": source,
+            "created": time.time(),
+        }
+        if session_enabled:
+            holder["state"] = state_store.switch_role_controller(
+                spath, role, target, prior=holder["state"], reason=reason,
+                source=source, created=entry["created"])
+            # Keep the in-memory config in lockstep with the saved config.
+            config[role] = dict(holder["state"]["config"][role])
+        else:
+            config[role] = dict(config[role], controller=target)
+            pending_switches[role] = entry
+        local_ids.pop(role, None)
+        trace.event("controller.switch.commit", role=role, phase=phase,
+                    source=source, reason=reason, from_controller=current,
+                    to_controller=target)
+        io_out.write("cowork: switched %s controller %s -> %s\n"
+                     % (role, current, target))
+        io_out.flush()
+        return True
+
+    def ensure_controller_available(role, reason="launch"):
+        while True:
+            controller = config[role].get("controller")
+            ok, alerts = check_controller_tool(controller)
+            if ok:
+                return True
+            alert = "\n".join(alerts)
+            trace.event("controller.failure", role=role, phase=phase,
+                        controller=controller, reason="missing_executable",
+                        artifact_progress=False)
+            ui.banner(io_out, _controller_failure_text(
+                role, controller, "missing executable", alert), "dissent")
+            action = _read_controller_failure_gate(io_in, io_out)
+            if action is _CTRL_RETRY:
+                trace.event("user.action", role=role,
+                            action="controller_failure_retry",
+                            reason=reason)
+                continue
+            if action is _CTRL_SWITCH:
+                trace.event("user.action", role=role,
+                            action="controller_failure_switch",
+                            reason=reason)
+                if switch_controller(role, reason="missing_executable",
+                                     source="gate"):
+                    return True
+                continue
+            trace.event("user.action", role=role,
+                        action="controller_failure_end", reason=reason)
+            return False
+
+    def recover_controller_failure(role, reason, alert=None):
+        while True:
+            controller = config[role].get("controller")
+            trace.event("controller.failure", role=role, phase=phase,
+                        controller=controller, reason=reason,
+                        artifact_progress=False)
+            ui.banner(io_out, _controller_failure_text(
+                role, controller, reason, alert), "dissent")
+            action = _read_controller_failure_gate(io_in, io_out)
+            if action is _CTRL_RETRY:
+                trace.event("user.action", role=role,
+                            action="controller_failure_retry",
+                            reason=reason)
+                return "retry"
+            if action is _CTRL_SWITCH:
+                trace.event("user.action", role=role,
+                            action="controller_failure_switch",
+                            reason=reason)
+                if switch_controller(role, reason=reason, source="gate"):
+                    return "switch"
+                continue
+            trace.event("user.action", role=role,
+                        action="controller_failure_end", reason=reason)
+            return "end"
+
+    def switch_arg_error():
+        if not args.switch_controller:
+            return None
+        role, target = args.switch_controller
+        return validate_switch_role(role, target, phase, selected, holder["state"])
+
+    err = switch_arg_error()
+    if err:
+        trace.event("run.end", rc=2, reason="switch_controller_validation")
+        io_out.write("cowork: " + err + "\n")
+        return 2
+    if args.switch_controller:
+        role, target = args.switch_controller
+        if not switch_controller(role, reason="cli", target=target, source="cli"):
+            trace.event("run.end", rc=1, reason="switch_controller_failed")
+            return 1
+
     # Resolved BEFORE the context step so we can skip the goal prompt on a
     # resume of the current phase's user-facing role.
-    lead_role = {"scouting": "scout", "planning": "planner",
-                 "building": "builder"}[phase]
+    lead_role = PHASE_LEADS[phase]
     lead_resume_id = role_resume_id(lead_role)
     if lead_resume_id:
         trace.event("run.resume", role=lead_role,
@@ -3948,7 +4600,8 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     session_id=lead_resume_id, phase=phase)
 
     # Step 3: context. On a resume, skip the goal prompt and auto-continue.
-    context = resolve_context(args, resuming=bool(lead_resume_id))
+    context = resolve_context(
+        args, resuming=bool(lead_resume_id) or bool(args.switch_controller))
 
     # Context invariant: explicit context is a session-wide event. Persist it as
     # the CURRENT session context (bumping the revision when it changed), and
@@ -4060,6 +4713,64 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
         intel_dir, session_uuid)
     build_review_path = state_store.build_review_path_for(
         intel_dir, session_uuid)
+
+    def pending_switch_for(role):
+        if session_enabled:
+            return state_store.read_pending_switch(holder["state"], role)
+        entry = pending_switches.get(role)
+        return dict(entry) if entry else None
+
+    def clear_pending_switch_for(role):
+        pending_switch_turns.pop(role, None)
+        if session_enabled:
+            holder["state"] = state_store.clear_pending_switch(
+                spath, role, prior=holder["state"])
+        else:
+            pending_switches.pop(role, None)
+
+    def switch_artifacts_for(role):
+        if role == "scout":
+            return [intel_path, intel_md_path, review_path]
+        if role == SCOUT_REVIEWER:
+            return [intel_path, intel_md_path, review_path]
+        if role == "planner":
+            return [intel_path, intel_md_path, plan_json_path, plan_md_path,
+                    planner_review_path]
+        if role == PLANNING_ADVISOR:
+            return [intel_path, intel_md_path, plan_json_path, plan_md_path,
+                    planner_review_path]
+        if role == "builder":
+            return [plan_json_path, plan_md_path, build_status_path,
+                    build_summary_path, build_review_path]
+        if role == BUILD_REVIEWER:
+            return [plan_json_path, plan_md_path, build_status_path,
+                    build_summary_path, build_review_path]
+        return []
+
+    def switch_note_for(role):
+        return switch_handoff_packet(
+            role, phase, pending_switch_for(role),
+            artifact_paths=switch_artifacts_for(role),
+            shared_context=shared_context,
+            pending_turn=pending_switch_turns.get(role))
+
+    def seed_with_switch_note(role, seed):
+        note = switch_note_for(role)
+        if not note:
+            return seed
+        seed = (seed or "").strip()
+        return (note + "\n\n" + seed) if seed else note
+
+    def prepare_fresh_seed_after_switch(role):
+        if role == "scout":
+            return with_discovery(shared_context)
+        if role == "planner":
+            return assemble_planner_seed(intel_path, shared_context)
+        if role == "builder":
+            return assemble_builder_seed(
+                plan_json_path, plan_md_path, shared_context)
+        return shared_context
+
     # Peer-evaluation assets: a per-role scratch file (each evaluator's only
     # eval write target) and the orchestrator-only aggregate scores file.
     eval_scratch = {
@@ -4253,9 +4964,15 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                     "the team.\n")
                 rc = 2
                 break
-            outcome_box = {"outcome": None}
+            if not ensure_controller_available("scout", reason="lead_launch"):
+                rc = 1
+                break
+            outcome_box = {"outcome": None, "payload": None}
             rc = run_scout_fn(
-                config, deliver_context("scout", scout_seed), selected,
+                config,
+                seed_with_switch_note(
+                    "scout", deliver_context("scout", scout_seed)),
+                selected,
                 io_in=io_in, io_out=io_out,
                 resume_id=role_resume_id("scout"),
                 on_session=role_saver("scout"),
@@ -4274,7 +4991,33 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 skip_baseline=scout_skip_baseline,
                 review_packet_ctx={"epoch": scouting_epoch_box["epoch"],
                                    "context_revision": current_rev},
-                on_outcome=lambda o: outcome_box.update(outcome=o))
+                switch_controller_fn=switch_controller,
+                reviewer_switch_note_fn=switch_note_for,
+                on_reviewer_switch_consumed=clear_pending_switch_for,
+                on_first_send_accepted=(
+                    (lambda: clear_pending_switch_for("scout"))
+                    if pending_switch_for("scout") else None),
+                reviewer_controller_check_fn=reviewer_controller_check,
+                on_outcome=lambda o, p=None: outcome_box.update(
+                    outcome=o, payload=p))
+            if rc != 0:
+                action = recover_controller_failure("scout", "startup_or_probe")
+                if action == "retry":
+                    continue
+                if action == "switch":
+                    scout_seed = prepare_fresh_seed_after_switch("scout")
+                    continue
+                break
+            if (rc == 0 and outcome_box["outcome"] == "switch_controller"):
+                payload = outcome_box["payload"] or {}
+                if payload.get("pending"):
+                    pending_switch_turns["scout"] = payload.get("pending")
+                if switch_controller("scout", reason=payload.get("reason"),
+                                     source="gate"):
+                    scout_seed = prepare_fresh_seed_after_switch("scout")
+                    continue
+                rc = 1
+                break
             if rc == 0:
                 ack_lead("scout")
             if (rc == 0 and outcome_box["outcome"] == "approved"
@@ -4293,12 +5036,17 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             break
 
         if phase == "planning":
+            if not ensure_controller_available("planner", reason="lead_launch"):
+                rc = 1
+                break
             planner_box = {"outcome": None, "payload": None}
             rc = run_planner_fn(
                 config,
-                deliver_context(
+                seed_with_switch_note(
                     "planner",
-                    planner_seed if planner_seed is not None else ""),
+                    deliver_context(
+                        "planner",
+                        planner_seed if planner_seed is not None else "")),
                 selected, io_in=io_in, io_out=io_out,
                 resume_id=role_resume_id("planner"),
                 on_session=role_saver("planner"),
@@ -4319,7 +5067,32 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
                 skip_baseline=planner_skip_baseline,
                 review_packet_ctx={"epoch": epoch_box["epoch"],
                                    "context_revision": current_rev},
+                switch_controller_fn=switch_controller,
+                reviewer_switch_note_fn=switch_note_for,
+                on_reviewer_switch_consumed=clear_pending_switch_for,
+                on_first_send_accepted=(
+                    (lambda: clear_pending_switch_for("planner"))
+                    if pending_switch_for("planner") else None),
+                reviewer_controller_check_fn=reviewer_controller_check,
                 on_outcome=lambda o, p: planner_box.update(outcome=o, payload=p))
+            if rc != 0:
+                action = recover_controller_failure("planner", "startup_or_probe")
+                if action == "retry":
+                    continue
+                if action == "switch":
+                    planner_seed = prepare_fresh_seed_after_switch("planner")
+                    continue
+                break
+            if (rc == 0 and planner_box["outcome"] == "switch_controller"):
+                payload = planner_box["payload"] or {}
+                if payload.get("pending"):
+                    pending_switch_turns["planner"] = payload.get("pending")
+                if switch_controller("planner", reason=payload.get("reason"),
+                                     source="gate"):
+                    planner_seed = prepare_fresh_seed_after_switch("planner")
+                    continue
+                rc = 1
+                break
             if rc == 0:
                 ack_lead("planner")
             if rc == 0 and planner_box["outcome"] == "handoff":
@@ -4370,11 +5143,16 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             break
 
         # building phase
+        if not ensure_controller_available("builder", reason="lead_launch"):
+            rc = 1
+            break
         builder_box = {"outcome": None, "payload": None}
         rc = run_builder_fn(
             config,
-            deliver_context("builder",
-                            builder_seed if builder_seed is not None else ""),
+            seed_with_switch_note(
+                "builder",
+                deliver_context("builder",
+                                builder_seed if builder_seed is not None else "")),
             selected, io_in=io_in, io_out=io_out,
             resume_id=role_resume_id("builder"),
             on_session=role_saver("builder"),
@@ -4397,7 +5175,32 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
             build_summary_path=build_summary_path,
             review_packet_ctx={"epoch": building_epoch_box["epoch"],
                                "context_revision": current_rev},
+            switch_controller_fn=switch_controller,
+            reviewer_switch_note_fn=switch_note_for,
+            on_reviewer_switch_consumed=clear_pending_switch_for,
+            on_first_send_accepted=(
+                (lambda: clear_pending_switch_for("builder"))
+                if pending_switch_for("builder") else None),
+            reviewer_controller_check_fn=reviewer_controller_check,
             on_outcome=lambda o, p: builder_box.update(outcome=o, payload=p))
+        if rc != 0:
+            action = recover_controller_failure("builder", "startup_or_probe")
+            if action == "retry":
+                continue
+            if action == "switch":
+                builder_seed = prepare_fresh_seed_after_switch("builder")
+                continue
+            break
+        if (rc == 0 and builder_box["outcome"] == "switch_controller"):
+            payload = builder_box["payload"] or {}
+            if payload.get("pending"):
+                pending_switch_turns["builder"] = payload.get("pending")
+            if switch_controller("builder", reason=payload.get("reason"),
+                                 source="gate"):
+                builder_seed = prepare_fresh_seed_after_switch("builder")
+                continue
+            rc = 1
+            break
         if rc == 0:
             ack_lead("builder")
         if rc == 0 and builder_box["outcome"] == "handoff":
@@ -4425,6 +5228,14 @@ def run_flow(args, io_in=None, io_out=None, which=None, run_scout_fn=None,
 def main(argv=None):
     try:
         args = build_parser().parse_args(argv)
+        if args.switch_controller and args.check:
+            sys.stderr.write(
+                "cowork: --switch-controller cannot be combined with --check.\n")
+            return 2
+        if args.switch_controller and args.report:
+            sys.stderr.write(
+                "cowork: --switch-controller cannot be combined with --report.\n")
+            return 2
         if args.check:
             return preflight.main()
         if args.report:

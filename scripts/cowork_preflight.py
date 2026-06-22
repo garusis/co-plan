@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""cowork preflight: verify the interpreter and the CLI tools the selected
-controllers need exist before anything is spun up.
+"""cowork preflight helpers.
+
+Normal runs check Python/UI dependencies globally and check controller CLIs
+on-demand when a role launches, so missing active controllers can reach the
+switch-controller recovery gate. `cowork --check` still uses this module to
+diagnose all controller CLIs in one shot.
 
 Python 3.9+, stdlib only.
 """

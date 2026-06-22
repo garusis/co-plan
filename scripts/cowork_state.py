@@ -688,6 +688,64 @@ def save_role_session(path, role, controller, session_id, prior=None):
     return state
 
 
+def read_pending_switch(state, role):
+    """Return the pending fresh-provider handoff metadata for `role`, if any."""
+    entry = ((state or {}).get("pending_switches") or {}).get(role)
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def clear_pending_switch(path, role, prior=None):
+    """Remove a role's pending switch marker, preserving the rest of state."""
+    state = dict(prior or load(path) or {})
+    pending = dict(state.get("pending_switches") or {})
+    pending.pop(role, None)
+    if pending:
+        state["pending_switches"] = pending
+    else:
+        state.pop("pending_switches", None)
+    save(path, state)
+    return state
+
+
+def switch_role_controller(path, role, target_controller, prior=None,
+                           reason=None, source=None, created=None):
+    """Persist a controller switch for one role.
+
+    The visible cowork session continues, but the provider-specific hidden
+    session cannot migrate. We therefore update the saved role config, clear the
+    active provider id for that role, preserve non-id bookkeeping fields on the
+    role session entry, and record a small pending handoff marker that the next
+    fresh launch can consume.
+    """
+    state = dict(prior or load(path) or {})
+    state.setdefault("team", state.get("team") or [])
+    config = dict(state.get("config") or {})
+    role_cfg = dict(config.get(role) or {})
+    from_controller = role_cfg.get("controller")
+    role_cfg["controller"] = target_controller
+    config[role] = role_cfg
+    state["config"] = config
+
+    sessions = dict(state.get("sessions") or {})
+    entry = dict(sessions.get(role) or {})
+    entry["controller"] = target_controller
+    entry.pop("id", None)
+    sessions[role] = entry
+    state["sessions"] = sessions
+
+    pending = dict(state.get("pending_switches") or {})
+    pending[role] = {
+        "from_controller": from_controller,
+        "to_controller": target_controller,
+        "reason": reason,
+        "source": source,
+        "created": created if created is not None else time.time(),
+    }
+    state["pending_switches"] = pending
+    save(path, state)
+    return state
+
+
 # --------------------------------------------------------------------------- #
 # Phase tracking.                                                               #
 #                                                                              #
