@@ -9496,5 +9496,712 @@ class DocsChecklistTest(unittest.TestCase):
         self.assertNotIn("## 6. Avoid Duplicate Context Replay ✅", text)
 
 
+def _init_git_repo():
+    """Create a committed temp git repo and return its absolute path."""
+    import tempfile
+    d = os.path.realpath(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-q", d], check=True)
+    subprocess.run(["git", "-C", d, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", d, "config", "user.name", "t"], check=True)
+    with open(os.path.join(d, "f.txt"), "w") as fh:
+        fh.write("x")
+    subprocess.run(["git", "-C", d, "add", "."], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
+    return d
+
+
+class WorktreeFlagTest(unittest.TestCase):
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def test_worktree_flag_optional_name(self):
+        # no name -> const True
+        a = self._args(["--worktree", "--context", "x"])
+        self.assertIs(a.worktree, True)
+        # explicit name
+        a = self._args(["--wt", "feat-x", "--context", "x"])
+        self.assertEqual(a.worktree, "feat-x")
+        # absent
+        a = self._args(["--context", "x"])
+        self.assertIsNone(a.worktree)
+
+    def test_wt_controller_default_and_choice(self):
+        self.assertEqual(self._args(["--context", "x"]).wt_controller, "claude")
+        self.assertEqual(
+            self._args(["--wt-controller", "codex", "--context", "x"])
+            .wt_controller, "codex")
+
+    def test_headless_flag_and_alias_and_non_interactive(self):
+        a = self._args(["--headless", "--context", "x"])
+        self.assertTrue(a.headless)
+        self.assertTrue(cowork._is_non_interactive(a))
+        a = self._args(["--auto", "--context", "x"])
+        self.assertTrue(a.headless)
+
+    def test_default_worktree_name(self):
+        self.assertEqual(cowork.default_worktree_name("abcdef0123456789"),
+                         "cowork-abcdef01")
+
+
+class WorktreeHelperTest(unittest.TestCase):
+    def test_git_gate_inside_and_outside(self):
+        repo = _init_git_repo()
+        self.addCleanup(lambda: shutil.rmtree(repo, ignore_errors=True))
+        self.assertEqual(cowork.git_worktree_toplevel(repo), repo)
+        # a subdir of the repo still resolves to the toplevel
+        sub = os.path.join(repo, "sub")
+        os.makedirs(sub)
+        self.assertEqual(cowork.git_worktree_toplevel(sub), repo)
+        # a non-git dir -> None (the gate fails fast)
+        import tempfile
+        nongit = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(nongit, ignore_errors=True))
+        self.assertIsNone(cowork.git_worktree_toplevel(nongit))
+
+    def test_brief_carries_collision_policy(self):
+        # Collision resolution is delegated to the agent prompt, so the brief
+        # MUST carry the explicit-name reuse-or-fail policy and the auto-name
+        # numeric-suffix policy — guard against a silent prompt regression.
+        explicit = cowork.assemble_worktree_brief("/s.json", "/base", "feat",
+                                                  True)
+        self.assertIn("EXPLICITLY", explicit)
+        self.assertIn("reuse", explicit.lower())
+        self.assertIn("report failure", explicit.lower())
+        auto = cowork.assemble_worktree_brief("/s.json", "/base", "cowork-ab",
+                                              False)
+        self.assertIn("AUTO-generated", auto)
+        self.assertIn("numeric suffix", auto.lower())
+        self.assertIn("cowork-ab-2", auto)
+
+    def _make_worktree(self, repo, name):
+        path = os.path.join(repo, ".worktrees", name)
+        subprocess.run(["git", "-C", repo, "worktree", "add", path, "-b", name],
+                       check=True, capture_output=True)
+        return os.path.realpath(path)
+
+    def test_validate_success(self):
+        repo = _init_git_repo()
+        self.addCleanup(lambda: shutil.rmtree(repo, ignore_errors=True))
+        wt = self._make_worktree(repo, "feat")
+        artifact = {"status": "ready",
+                    "result": {"worktree_path": wt, "branch": "feat"}}
+        ok, path, branch, err = cowork.validate_worktree(repo, artifact)
+        self.assertTrue(ok, err)
+        self.assertEqual(os.path.realpath(path), wt)
+        self.assertEqual(branch, "feat")
+
+    def test_validate_failures(self):
+        repo = _init_git_repo()
+        self.addCleanup(lambda: shutil.rmtree(repo, ignore_errors=True))
+        wt = self._make_worktree(repo, "feat")
+        # no artifact
+        self.assertFalse(cowork.validate_worktree(repo, None)[0])
+        # status failed
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "failed", "result": {"error": "boom"}})[0])
+        # handoff_back is also a failure (no hand-back partner)
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "handoff_back"})[0])
+        # non-absolute path
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "ready",
+                   "result": {"worktree_path": "rel/x", "branch": "feat"}})[0])
+        # nonexistent path
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "ready",
+                   "result": {"worktree_path": "/nope/zzz", "branch": "f"}})[0])
+        # missing branch
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "ready", "result": {"worktree_path": wt}})[0])
+        # unregistered path (a real dir not registered as a worktree)
+        import tempfile
+        stray = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(stray, ignore_errors=True))
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "ready",
+                   "result": {"worktree_path": stray, "branch": "feat"}})[0])
+        # branch mismatch
+        self.assertFalse(cowork.validate_worktree(
+            repo, {"status": "ready",
+                   "result": {"worktree_path": wt, "branch": "other"}})[0])
+
+
+class RunWorktreeTest(unittest.TestCase):
+    """run_worktree spawns one agent (injected) and reads back its artifact."""
+
+    def _status_path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, "worktree.status.json")
+
+    def test_reads_back_agent_artifact(self):
+        status = self._status_path()
+        sent = {}
+
+        def factory(controller):
+            class FakeSession:
+                def send(self, text):
+                    sent["text"] = text
+                    with open(status, "w") as fh:
+                        json.dump({"role": "worktree", "status": "ready",
+                                   "result": {"worktree_path": "/abs/wt",
+                                              "branch": "feat"}}, fh)
+
+                def close(self):
+                    sent["closed"] = True
+            return FakeSession()
+
+        cfg = {"controller": "codex", "yolo": True, "mode": "implement"}
+        artifact = cowork.run_worktree(
+            cfg, status, "/base/repo", "feat", True,
+            io_out=io.StringIO(), session_factory=factory)
+        self.assertEqual(artifact["status"], "ready")
+        self.assertEqual(artifact["result"]["branch"], "feat")
+        self.assertTrue(sent.get("closed"))
+        # the brief carries the base repo, the name, and the explicit policy
+        self.assertIn("/base/repo", sent["text"])
+        self.assertIn("feat", sent["text"])
+
+    def test_no_artifact_returns_none(self):
+        status = self._status_path()
+
+        def factory(controller):
+            class FakeSession:
+                def send(self, text):
+                    pass  # writes nothing
+
+                def close(self):
+                    pass
+            return FakeSession()
+
+        cfg = {"controller": "codex", "yolo": True, "mode": "implement"}
+        artifact = cowork.run_worktree(
+            cfg, status, "/base/repo", "auto", False,
+            io_out=io.StringIO(), session_factory=factory)
+        self.assertIsNone(artifact)
+
+
+class WorktreeFlowTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore_env():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore_env)
+        cwd = os.getcwd()
+        self.addCleanup(lambda: os.chdir(cwd))
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _repo(self):
+        repo = _init_git_repo()
+        self.addCleanup(lambda: shutil.rmtree(repo, ignore_errors=True))
+        return repo
+
+    def _creating_fn(self, calls):
+        """A run_worktree_fn that really creates the worktree and records the
+        call. Returns a ready artifact pointing at the created path."""
+        def fn(wt_config, status_path, base, name, explicit, **kw):
+            calls.append({"base": base, "name": name, "explicit": explicit,
+                          "controller": wt_config["controller"]})
+            path = os.path.join(base, ".worktrees", name)
+            subprocess.run(
+                ["git", "-C", base, "worktree", "add", path, "-b", name],
+                check=True, capture_output=True)
+            return {"status": "ready",
+                    "result": {"worktree_path": os.path.realpath(path),
+                               "branch": name}}
+        return fn
+
+    def test_gate_outside_git_repo_is_rc2(self):
+        import tempfile
+        nongit = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(nongit, ignore_errors=True))
+        os.chdir(nongit)
+        scout_calls = []
+
+        def fake_scout(*a, **k):
+            scout_calls.append(1)
+            return 0
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--worktree", "--team", "scout", "--context", "x",
+                        "--no-session"]),
+            io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout,
+            run_worktree_fn=lambda *a, **k: self.fail("role ran outside git"))
+        self.assertEqual(rc, 2)
+        self.assertIn("requires launching inside a git work tree",
+                      out.getvalue())
+        self.assertEqual(scout_calls, [])  # never reached scouting
+
+    def test_creates_and_redirects_into_worktree(self):
+        repo = self._repo()
+        os.chdir(repo)
+        calls = []
+        seen = {}
+
+        def fake_scout(config, context, selected, **kw):
+            seen["cwd"] = os.path.realpath(os.getcwd())
+            return 0
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--wt-controller", "codex",
+                        "--team", "scout", "--context", "x", "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        # the role ran once, with the single base toplevel and explicit name
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["base"], repo)
+        self.assertEqual(calls[0]["name"], "feat")
+        self.assertTrue(calls[0]["explicit"])
+        self.assertEqual(calls[0]["controller"], "codex")
+        # the session was redirected INTO the created worktree
+        self.assertEqual(seen["cwd"],
+                         os.path.realpath(os.path.join(repo, ".worktrees",
+                                                       "feat")))
+
+    def test_validation_failure_no_chdir_rc2(self):
+        repo = self._repo()
+        os.chdir(repo)
+        before = os.path.realpath(os.getcwd())
+        scout_calls = []
+
+        def fake_scout(*a, **k):
+            scout_calls.append(1)
+            return 0
+        rc = cowork.run_flow(
+            self._args(["--worktree", "--team", "scout", "--context", "x",
+                        "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout,
+            run_worktree_fn=lambda *a, **k: {
+                "status": "failed", "result": {"error": "boom"}})
+        self.assertEqual(rc, 2)
+        self.assertEqual(os.path.realpath(os.getcwd()), before)  # no chdir
+        self.assertEqual(scout_calls, [])
+
+    def test_auto_name_default(self):
+        repo = self._repo()
+        os.chdir(repo)
+        calls = []
+        rc = cowork.run_flow(
+            self._args(["--worktree", "--team", "scout", "--context", "x",
+                        "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: 0,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        # auto name = cowork-<short session id>; controller defaults to claude
+        self.assertTrue(calls[0]["name"].startswith("cowork-"))
+        self.assertFalse(calls[0]["explicit"])
+        self.assertEqual(calls[0]["controller"], "claude")
+
+    def test_worktree_and_headless_compose(self):
+        repo = self._repo()
+        os.chdir(repo)
+        calls = []
+        seen = {}
+
+        def fake_scout(config, context, selected, headless=False, **kw):
+            seen["cwd"] = os.path.realpath(os.getcwd())
+            seen["headless"] = headless
+            return 0
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--headless", "--team", "scout",
+                        "--context", "x", "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)  # worktree provisioned first
+        self.assertTrue(seen["headless"])  # then the flow runs headless inside
+        self.assertEqual(seen["cwd"],
+                         os.path.realpath(os.path.join(repo, ".worktrees",
+                                                       "feat")))
+
+    def test_resume_reuses_existing_worktree(self):
+        repo = self._repo()
+        os.chdir(repo)
+        spath = os.path.join(repo, ".cowork", "session.json")
+        calls = []
+        # run 1: creates + records the worktree
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--team", "scout",
+                        "--context", "x", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: 0,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        saved = state_store.load(spath)
+        self.assertIsNotNone(state_store.get_worktree(saved))
+        os.chdir(repo)  # run 1 redirected us into the worktree; back to launch
+        # run 2 (resume): reuses the recorded worktree, role NOT re-run
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--team", "scout",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: 0,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)  # no second creation
+
+    def test_resume_recreates_when_recorded_worktree_is_stale(self):
+        repo = self._repo()
+        os.chdir(repo)
+        spath = os.path.join(repo, ".cowork", "session.json")
+        calls = []
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--team", "scout",
+                        "--context", "x", "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: 0,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        # make the recorded worktree STALE: deregister it from git
+        wtpath = os.path.join(repo, ".worktrees", "feat")
+        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force",
+                        wtpath], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "branch", "-D", "feat"],
+                       check=True, capture_output=True)
+        os.chdir(repo)
+        # run 2: recorded path no longer validates -> re-create, never a blind
+        # chdir into the stale/unregistered path
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--team", "scout",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: 0,
+            run_worktree_fn=self._creating_fn(calls))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 2)  # re-created, not reused
+
+    def test_headless_runtime_note_in_lead_seed_and_reviewer_context(self):
+        repo = self._repo()
+        os.chdir(repo)
+        seen = {}
+
+        def fake_scout(config, context, selected, reviewer_context=None, **kw):
+            seen["context"] = context
+            seen["reviewer_context"] = reviewer_context
+            return 0
+        rc = cowork.run_flow(
+            self._args(["--worktree", "feat", "--headless", "--team", "scout",
+                        "--context", "GOALTEXT", "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout,
+            run_worktree_fn=self._creating_fn([]))
+        self.assertEqual(rc, 0)
+        self.assertIn("[headless mode]", seen["context"])
+        self.assertIn("[headless mode]", seen["reviewer_context"])
+        # the lead seed still carries the original goal
+        self.assertIn("GOALTEXT", seen["context"])
+
+    def test_missing_controller_headless_fails_without_prompt(self):
+        repo = self._repo()
+        os.chdir(repo)
+        rc = cowork.run_flow(
+            self._args(["--headless", "--team", "scout", "--context", "x",
+                        "--no-session"]),
+            io_out=io.StringIO(), which=lambda c: None,  # controller missing
+            run_scout_fn=lambda *a, **k: self.fail("should not launch scout"))
+        self.assertEqual(rc, 1)  # ensure_controller_available returns False
+
+
+class HeadlessRoleLoopTest(unittest.TestCase):
+    """Drive _role_loop with headless=True and NO human input — every gate must
+    auto-resolve and the loop must never hang."""
+
+    def _path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "x.json")
+
+    def _session(self, path, writes):
+        class ScriptedSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                w = writes.pop(0) if writes else None
+                if w is not None:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as fh:
+                        json.dump(w, fh)
+
+            def close(self):
+                self.closed = True
+        return ScriptedSession()
+
+    def _review_fn(self, verdicts):
+        def fn(status_path, round_index):
+            return verdicts.pop(0) if verdicts else {"verdict": "approve"}
+        return fn
+
+    _READY = {"status": "ready_for_review", "result": {}}
+
+    def test_needs_input_nudged_then_ready(self):
+        path = self._path()
+        sess = self._session(
+            path, [{"status": "needs_input", "result": {}}, dict(self._READY)])
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=True)
+        self.assertEqual(outcome, "approved")
+        self.assertEqual(len(sess.sent), 2)
+        self.assertIn("headless", sess.sent[1].lower())
+
+    def test_needs_input_loop_bounded(self):
+        path = self._path()
+        # always a DIFFERENT needs_input (defeats the byte-level no-op detector)
+        writes = [{"status": "needs_input", "result": {"n": i}}
+                  for i in range(20)]
+        sess = self._session(path, writes)
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=True)
+        self.assertEqual(outcome, "ended")  # HEADLESS_NUDGE_CAP backstop
+        self.assertLessEqual(len(sess.sent), cowork.HEADLESS_NUDGE_CAP + 1)
+
+    def test_ready_auto_approves_without_input(self):
+        path = self._path()
+        sess = self._session(path, [dict(self._READY)])
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=True)
+        self.assertEqual(outcome, "approved")
+        self.assertEqual(len(sess.sent), 1)
+
+    def test_reviewer_approve_consensus_advances(self):
+        path = self._path()
+        sess = self._session(path, [dict(self._READY)])
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=True,
+            review_fn=self._review_fn([{"verdict": "approve"}]))
+        self.assertEqual(outcome, "approved")
+
+    def test_reviewer_needs_user_downgraded_to_revise(self):
+        path = self._path()
+        sess = self._session(path, [dict(self._READY), dict(self._READY)])
+        rfn = self._review_fn([
+            {"verdict": "needs_user", "user_question": "Support legacy X?"},
+            {"verdict": "approve"}])
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=out, headless=True, review_fn=rfn)
+        self.assertEqual(outcome, "approved")
+        # the question reached the LEAD as a revise finding, not the user
+        self.assertIn("Support legacy X?", sess.sent[1])
+        self.assertNotIn("Support legacy X?", out.getvalue())
+
+    def test_reviewer_failure_skips_under_headless(self):
+        path = self._path()
+        sess = self._session(path, [dict(self._READY)])
+        # every verdict is unusable -> failure; headless skips after the cap
+        rfn = self._review_fn([{}, {}, {}, {}])
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=True, review_fn=rfn)
+        self.assertEqual(outcome, "approved")
+
+    def test_round_cap_accepts_with_dissent(self):
+        path = self._path()
+        sess = self._session(path, [dict(self._READY) for _ in range(8)])
+        rfn = self._review_fn([{"verdict": "revise", "findings": ["nit"]}
+                               for _ in range(8)])
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=out, headless=True, review_fn=rfn)
+        self.assertEqual(outcome, "approved")
+        self.assertIn("cap reached", out.getvalue())
+
+    def test_handoff_back_auto_declined(self):
+        path = self._path()
+        sess = self._session(path, [
+            {"status": "handoff_back", "handoff": "re-scope", "result": {}},
+            dict(self._READY)])
+        rc, outcome, payload = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=True, handoff_enabled=True)
+        self.assertEqual(outcome, "approved")  # NOT "handoff"
+        self.assertEqual(len(sess.sent), 2)
+
+    def test_controller_failure_ends_under_headless_no_prompt(self):
+        # A send failure with no status write: headless ends cleanly instead of
+        # showing the interactive retry/switch/end controller-failure gate.
+        path = self._path()
+
+        class FailSession:
+            def __init__(self):
+                self.sent = []
+                self.closed = False
+
+            def send(self, text):
+                self.sent.append(text)
+                return {"ok": False, "result": "error",
+                        "error_type": "usage_limit"}
+
+            def close(self):
+                self.closed = True
+        sess = FailSession()
+        out = io.StringIO()
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=out, headless=True)
+        self.assertEqual(outcome, "ended")
+        self.assertNotIn("cannot make progress", out.getvalue())
+        self.assertTrue(sess.closed)
+
+    def test_without_headless_does_not_auto_progress(self):
+        # Regression guard: same needs_input write, but WITHOUT headless and no
+        # input -> the loop ends (EOF) instead of nudging. No bypass.
+        path = self._path()
+        sess = self._session(path, [{"status": "needs_input", "result": {}}])
+        rc, outcome, _ = cowork._role_loop(
+            sess, "seed", path, context="", io_in=io.StringIO(""),
+            io_out=io.StringIO(), headless=False)
+        self.assertEqual(outcome, "ended")
+        self.assertEqual(sess.sent, ["seed"])  # no nudge sent
+
+
+class WorktreeStateTest(unittest.TestCase):
+    def _tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def test_set_and_get_worktree_roundtrip(self):
+        spath = self._tmp()
+        state = state_store.ensure_session(spath, None, "S")
+        self.assertIsNone(state_store.get_worktree(state))
+        state = state_store.set_worktree(spath, "/abs/wt", "feat", prior=state)
+        got = state_store.get_worktree(state)
+        self.assertEqual(got, {"path": "/abs/wt", "branch": "feat"})
+        # survives a reload
+        self.assertEqual(state_store.get_worktree(state_store.load(spath)),
+                         {"path": "/abs/wt", "branch": "feat"})
+
+    def test_resume_discovery_is_cwd_relative(self):
+        # D3 resume-from-launch-dir: the session store is discovered from the
+        # cwd, so a session created at the launch dir is NOT found from inside a
+        # (sibling) worktree dir — confirming resume must be from the launch dir.
+        import tempfile
+        launch = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(launch, ignore_errors=True))
+        worktree = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(worktree, ignore_errors=True))
+        state_store.ensure_session(
+            state_store.session_path(launch), None, "S")
+        self.assertTrue(state_store.discover_session_files(launch))
+        self.assertEqual(state_store.discover_session_files(worktree), [])
+
+
+class HeadlessFlowContextTest(unittest.TestCase):
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def test_headless_without_context_is_rc2(self):
+        out = io.StringIO()
+        rc = cowork.run_flow(
+            self._args(["--headless", "--team", "scout", "--no-session"]),
+            io_out=out, which=lambda c: "/bin/" + c,
+            run_scout_fn=lambda *a, **k: self.fail("should not reach scout"))
+        self.assertEqual(rc, 2)
+        self.assertIn("requires initial context", out.getvalue())
+
+
+class HeadlessReviewerResumeTest(unittest.TestCase):
+    """A RESUMED reviewer's first headless turn uses context_update (not
+    reviewer_context), so the headless note must ride context_update too."""
+
+    def setUp(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        old = os.environ.get("COWORK_SESSIONS_ROOT")
+        os.environ["COWORK_SESSIONS_ROOT"] = root
+
+        def restore():
+            if old is None:
+                os.environ.pop("COWORK_SESSIONS_ROOT", None)
+            else:
+                os.environ["COWORK_SESSIONS_ROOT"] = old
+        self.addCleanup(restore)
+
+    def _args(self, argv):
+        return cowork.build_parser().parse_args(argv)
+
+    def _tmp_session(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return os.path.join(d, ".cowork", "session.json")
+
+    def test_resumed_reviewer_context_update_carries_headless_note(self):
+        spath = self._tmp_session()
+        team = ["scout", "scout-reviewer"]
+        state = state_store.ensure_session(spath, None, "S")
+        state = state_store.save_config(
+            spath, team, cowork.default_config(team), prior=state)
+        # a saved scout-reviewer session id makes it a RESUMED reviewer
+        state_store.save_role_session(
+            spath, "scout-reviewer", "codex", "rev-1", prior=state)
+        seen = {}
+
+        def fake_scout(config, context, selected,
+                       reviewer_context_update=None, reviewer_context=None,
+                       **kw):
+            seen["cu"] = reviewer_context_update
+            seen["ctx"] = reviewer_context
+            return 0
+        rc = cowork.run_flow(
+            self._args(["--headless", "--context", "x",
+                        "--session-file", spath]),
+            io_out=io.StringIO(), which=lambda c: "/bin/" + c,
+            run_scout_fn=fake_scout)
+        self.assertEqual(rc, 0)
+        # the resumed reviewer's first-turn context_update carries the note...
+        self.assertIsNotNone(seen["cu"])
+        self.assertIn("[headless mode]", seen["cu"])
+        # ...and fresh reviewers still get it via reviewer_context
+        self.assertIn("[headless mode]", seen["ctx"])
+
+
+class RolePromptHeadlessDirectiveTest(unittest.TestCase):
+    def test_every_role_prompt_carries_headless_directive(self):
+        roles_dir = os.path.join(_HERE, "..", "roles")
+        for name in ("scout", "planner", "builder", "scout-reviewer",
+                     "planning-advisor", "build-reviewer"):
+            with open(os.path.join(roles_dir, name + ".md")) as fh:
+                text = fh.read()
+            self.assertIn("Headless mode", text, name)
+
+    def test_worktree_role_prompt_exists(self):
+        path = os.path.join(_HERE, "..", "roles", "worktree.md")
+        with open(path) as fh:
+            text = fh.read()
+        self.assertIn("worktree", text.lower())
+        self.assertIn("status", text.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
