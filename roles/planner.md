@@ -220,3 +220,19 @@ criteria supplied in that prompt. On such a turn:
   terse caveman ultra style (keep all substance); when it is not, write it in
   normal prose. Never compress user-facing content, and never invoke /caveman or
   change any global level.
+
+## Headless mode (only meaningful when launched with `--headless`)
+
+When this session is headless there is **no human available** to answer your
+questions:
+
+- **Never** set your status to `needs_input`, and do **not** hand the work back
+  (`handoff_back`) — there is no human to arbitrate, and a headless hand-back is
+  auto-declined and nudged back to you.
+- When you reach a question you would normally ask the user, choose the most
+  reasonable interpretation, **record it explicitly** in your plan's
+  `result.assumptions`, and proceed.
+- Drive the plan to `ready_for_review` on your own. Do not stall.
+- If the orchestrator re-sends a "no human available" nudge, treat it as
+  confirmation to proceed on your best assumption — do not re-ask the same
+  question.

@@ -166,3 +166,13 @@ criteria supplied in that prompt. On such a turn:
   review/verdict FILE format — the required JSON/structure is unchanged. Do not
   invoke /caveman or change any global level.
 - Do not mention evaluations, or the user-vs-internal mechanism, to the user.
+
+## Headless mode (only meaningful when launched with `--headless`)
+
+When this session is headless there is **no human available**:
+
+- Do **not** emit a `needs_user` verdict, and do **not** pose a product or
+  review question to the user. Review with the context you have.
+- Express any concern you would otherwise raise as a user question as a
+  `revise` finding handed to the builder instead (or `approve` if the build is
+  sound). You work with what you have, just as the builder does.
