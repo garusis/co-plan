@@ -119,8 +119,10 @@ guards. Run `cowork` in a trusted/isolated workspace.
   - **Codex CLI** — `npm install -g @openai/codex` (Node 18+) or
     `brew install --cask codex`
 
-`cowork`'s preflight reports exactly which of these is missing before doing
-anything (the pip packages are checked only for the interactive flow).
+`cowork --check` reports exactly which of these is missing. During a normal run,
+Python and interactive UI packages are checked up front, while controller CLIs
+are checked when the role that needs them is about to launch; that lets a saved
+session offer controller switching instead of failing before the phase starts.
 
 ## Install
 
@@ -187,6 +189,22 @@ echo "the brief" | ./cowork --team scout --context-file -
 - `--session-file PATH` — use a specific session store (default
   `./.cowork/session.json`).
 - `--no-session` — do not read or write the session store.
+- `--switch-controller ROLE=CONTROLLER` — update one current-phase role in an
+  existing saved session to `claude` or `codex`, then continue that session.
+  Examples:
+
+  ```bash
+  ./cowork --switch-controller planner=codex
+  ./cowork --session-file .cowork/session.<uuid>.json --switch-controller builder=claude
+  ```
+
+  The role must be in the effective current phase pair: `scout` or
+  `scout-reviewer` during scouting, `planner` or `planning-advisor` during
+  planning, and `builder` or `build-reviewer` during building. `--session-file`
+  targets one saved session; `--resume` can be used to pick an existing session
+  interactively. `--switch-controller` requires saved team/config state and
+  cannot be combined with `--team`, `--config`, `--new`, `--no-session`,
+  `--check`, or `--report`.
 
 Defaults per role:
 
@@ -256,6 +274,42 @@ task, pass `--context "…"`; to **start fresh**, use `--no-session` (or delete
 `.cowork/session.json`). `--session-file` points at a different store. Changing
 the saved config is out of scope for now — delete
 `.cowork/session.json` to start fresh.
+
+### Controller switching
+
+If the active controller for the current role is unavailable or stops making
+progress, cowork can switch that role to the other controller and keep the
+session moving. The cowork phase, artifacts, shared context, review baselines,
+epochs, and working tree stay in place. The provider conversation itself starts
+fresh because Claude and Codex do not expose a shared hidden-chat migration path;
+cowork seeds the new controller with an explicit handoff packet containing the
+current phase, role, shared context, relevant artifact paths and contents, and
+the failed pending turn when there was one.
+
+The switch option appears at these recovery points:
+
+- missing active controller executable at role launch;
+- controller start/resume/probe failure;
+- lead-role turn failure without status-artifact progress;
+- the stuck lead-role gate; and
+- the reviewer/advisor failure gate.
+
+The same state update is available from the CLI:
+
+```bash
+./cowork --switch-controller planner=codex
+./cowork --session-file .cowork/session.<uuid>.json --switch-controller builder=claude
+```
+
+Before committing the switch, cowork checks the target controller executable and
+uses the existing install guidance if it is missing. When the target is Claude,
+cowork also runs the stream-json probe for that role's prompt/mode/permission
+settings. A failed target check leaves the current controller unchanged.
+
+V1 is manual only. There is no automatic rate-limit failover, no migration of
+hidden Claude/Codex conversation history, and no guarantee that switching back
+later resumes the exact old provider session id; the saved role entry records one
+active controller/id pair at a time.
 
 ### Orchestration trace
 
