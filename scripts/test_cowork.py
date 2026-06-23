@@ -4366,14 +4366,21 @@ class PlannerSeedTest(unittest.TestCase):
         intel = self._intel('{"status": "ready_for_review", "result": {"k": 1}}')
         seed = cowork.assemble_planner_seed(intel, "the goal")
         self.assertIn("APPROVED", seed)
-        self.assertIn('"k": 1', seed)
+        # #1: path-first — the intel path + a read-from-disk instruction, NOT
+        # the embedded JSON body.
+        self.assertIn(intel, seed)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
+        self.assertNotIn('"k": 1', seed)
         self.assertIn("the goal", seed)
 
     def test_intel_updated_block_carries_intel(self):
         intel = self._intel('{"result": {"new": true}}')
         block = cowork.intel_updated_block(intel)
         self.assertIn("intel changed", block)
-        self.assertIn('"new": true', block)
+        # #1: path-first wake — path + read instruction, not the body.
+        self.assertIn(intel, block)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, block)
+        self.assertNotIn('"new": true', block)
 
     def test_handoff_wake_block_carries_payload(self):
         block = cowork.handoff_wake_block("narrow the scope to X")
@@ -4880,7 +4887,10 @@ class PhaseChainFlowTest(unittest.TestCase):
         # fresh planner is seeded with the approved intel + shared context
         seed = calls["planner"][0]["context"]
         self.assertIn("APPROVED", seed)
-        self.assertIn('"finding": "F1"', seed)
+        # #1: the fresh planner is seeded path-first (read instruction), not the
+        # embedded intel body.
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
+        self.assertNotIn('"finding": "F1"', seed)
         self.assertIn("build the thing", seed)
         # planner artifacts carry uuid-free names; the session FOLDER isolates them
         self.assertIn("planner.plan.json", calls["planner"][0]["plan_json_path"])
@@ -5174,7 +5184,9 @@ class PhaseChainFlowTest(unittest.TestCase):
         self.assertIsNone(calls["planner"][0]["resume_id"])  # fresh session
         seed = calls["planner"][0]["context"]
         self.assertIn("APPROVED", seed)
-        self.assertIn('"finding": "F1"', seed)
+        # #1: path-first seed (read instruction), not the embedded intel body.
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
+        self.assertNotIn('"finding": "F1"', seed)
 
     def test_phase_change_traced(self):
         spath = self._tmp_session()
@@ -5618,10 +5630,14 @@ class EvaluateFnTest(_EvalEnvMixin, unittest.TestCase):
             "planner", "planning-advisor", "planning", scratch,
             state_store.scores_path_for("S"), "S", intel_path=intel)
         fn(sess, {"verdict": "revise"}, 1)
-        # first turn: bundled prompt names both evaluatees + embeds the intel
+        # first turn: bundled prompt names both evaluatees; the consumed intel
+        # rides path-first (#2 — path + read instruction, not the body), while
+        # the small verdict JSON stays inline.
         self.assertIn("Evaluatee: planning-advisor", sess.sent[0])
         self.assertIn("Evaluatee: scout", sess.sent[0])
-        self.assertIn("F-INTEL", sess.sent[0])
+        self.assertNotIn("F-INTEL", sess.sent[0])
+        self.assertIn(intel, sess.sent[0])
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, sess.sent[0])
         writers["evaluatees"] = ("planning-advisor",)
         fn(sess, {"verdict": "approve"}, 2)
         fn(sess, {"verdict": "approve"}, 1)   # round reset: still no re-bundle
@@ -6103,9 +6119,13 @@ class MakeReviewFnEvalTest(_EvalEnvMixin, unittest.TestCase):
         fn(os.path.join(d, "planner.plan.S.json"), 1)   # reset: no re-bundle
         first = [s["evaluatee"] for s in runner.seen[0]["eval_specs"]]
         self.assertEqual(first, ["planner", "scout"])
-        # the ->scout spec embeds the intel JSON read at eval time
+        # the ->scout spec sends the intel path-first (#2 — path + read
+        # instruction, not the body)
         scout_spec = runner.seen[0]["eval_specs"][1]
-        self.assertIn("F-INTEL", scout_spec["artifact_block"])
+        self.assertNotIn("F-INTEL", scout_spec["artifact_block"])
+        self.assertIn(intel, scout_spec["artifact_block"])
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION,
+                      scout_spec["artifact_block"])
         self.assertEqual(scout_spec["context"], "consumed-intel")
         for later in runner.seen[1:]:
             self.assertEqual(
@@ -6449,16 +6469,25 @@ class BuilderSeedTest(unittest.TestCase):
         pj, pm = self._plan('{"result": {"k": 1}}', "# THE PLAN")
         seed = cowork.assemble_builder_seed(pj, pm, "the goal")
         self.assertIn("APPROVED", seed)
-        self.assertIn('"k": 1', seed)
-        self.assertIn("# THE PLAN", seed)
+        # #1: path-first — both plan paths + a read-from-disk instruction, NOT
+        # the embedded bodies.
+        self.assertIn(pj, seed)
+        self.assertIn(pm, seed)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
+        self.assertNotIn('"k": 1', seed)
+        self.assertNotIn("# THE PLAN", seed)
         self.assertIn("the goal", seed)
 
     def test_plan_updated_block_carries_plan(self):
         pj, pm = self._plan('{"result": {"new": true}}', "# UPDATED")
         block = cowork.plan_updated_block(pj, pm)
         self.assertIn("plan changed", block)
-        self.assertIn('"new": true', block)
-        self.assertIn("# UPDATED", block)
+        # #1: path-first wake — both paths + read instruction, not the bodies.
+        self.assertIn(pj, block)
+        self.assertIn(pm, block)
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, block)
+        self.assertNotIn('"new": true', block)
+        self.assertNotIn("# UPDATED", block)
 
     def test_plan_handback_wake_block_carries_payload(self):
         block = cowork.plan_handback_wake_block("re-plan the data layer")
@@ -6914,8 +6943,10 @@ class BuildPhaseFlowTest(unittest.TestCase):
         # fresh builder seeded with the approved plan + shared context
         seed = calls["builder"][0]["context"]
         self.assertIn("APPROVED", seed)
-        self.assertIn('"step": "S1"', seed)
-        self.assertIn("# PLAN MD", seed)
+        # #1: path-first seed (read instruction), not the embedded plan bodies.
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
+        self.assertNotIn('"step": "S1"', seed)
+        self.assertNotIn("# PLAN MD", seed)
         self.assertIn("do it", seed)
         # builder artifacts carry uuid-free names; the session FOLDER isolates them
         self.assertIn("builder.status.json",
@@ -7099,7 +7130,9 @@ class BuildPhaseFlowTest(unittest.TestCase):
         self.assertIsNone(calls["builder"][0]["resume_id"])
         seed = calls["builder"][0]["context"]
         self.assertIn("APPROVED", seed)
-        self.assertIn('"step": "S1"', seed)
+        # #1: path-first seed (read instruction), not the embedded plan body.
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, seed)
+        self.assertNotIn('"step": "S1"', seed)
 
 
 class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
@@ -7142,8 +7175,14 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
         spec = cowork._consumed_upstream_spec(
             consumed, None, "builder", 1)
         self.assertEqual(spec["evaluatee"], "planner")
-        self.assertIn("G-PLAN", spec["artifact_block"])
-        self.assertIn("# PLAN-MD-MARKER", spec["artifact_block"])
+        # #2: both plan artifacts ride path-first (paths + read instruction),
+        # not their embedded bodies.
+        self.assertIn(pj, spec["artifact_block"])
+        self.assertIn(pm, spec["artifact_block"])
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION,
+                      spec["artifact_block"])
+        self.assertNotIn("G-PLAN", spec["artifact_block"])
+        self.assertNotIn("# PLAN-MD-MARKER", spec["artifact_block"])
         self.assertEqual(spec["building_epoch"], 3)
 
     def test_builder_evaluate_fn_bundles_planner_once_per_phase(self):
@@ -7159,7 +7198,10 @@ class BuildingEvalTest(_EvalEnvMixin, unittest.TestCase):
         fn(sess, {"verdict": "revise"}, 1)
         self.assertIn("Evaluatee: build-reviewer", sess.sent[0])
         self.assertIn("Evaluatee: planner", sess.sent[0])
-        self.assertIn("G-PLAN", sess.sent[0])
+        # #2: consumed plan rides path-first, not its embedded body.
+        self.assertNotIn("G-PLAN", sess.sent[0])
+        self.assertIn(pj, sess.sent[0])
+        self.assertIn(diffpacket.FULL_REREAD_INSTRUCTION, sess.sent[0])
         # round 2 (and any later round) does not re-bundle the planner eval
         sess2 = self._session(scratch, ("build-reviewer",))
         fn(sess2, {"verdict": "approve"}, 2)
@@ -8899,6 +8941,8 @@ class ReportTest(unittest.TestCase):
             cowork_report.summarize_trace(self._synthetic()), "UUID")
         for needle in ("Prompt bytes by role", "Prompt bytes by prompt kind",
                        "Largest single prompts", "Artifact contribution",
+                       "Artifact delivery breakdown",
+                       "Role/system-prompt bytes by role",
                        "Review-skip hits", "Controller-reported usage"):
             self.assertIn(needle, text)
 
@@ -8950,6 +8994,95 @@ class ReportTest(unittest.TestCase):
                 os.environ.pop("COWORK_SESSIONS_ROOT", None)
             else:
                 os.environ["COWORK_SESSIONS_ROOT"] = old
+
+
+class DeliveryAccountingTest(unittest.TestCase):
+    """#3/#4: honest byte accounting — delivery tags, embedded-vs-touched, the
+    role/system-prompt bytes section."""
+
+    def _file(self, body):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        p = os.path.join(d, "art.json")
+        with open(p, "w") as fh:
+            fh.write(body)
+        return p
+
+    def test_descriptors_tag_delivery_and_embedded_bytes(self):
+        p = self._file('{"k": "x" }' + " " * 200)  # a sizable body
+        full = os.path.getsize(p)
+        # embedded delivery (legacy default): embedded_bytes == full body bytes.
+        emb = cowork._artifact_descriptors([p])
+        self.assertEqual(emb[0]["delivery"], "embedded")
+        self.assertEqual(emb[0]["embedded_bytes"], full)
+        self.assertEqual(emb[0]["bytes"], full)
+        # path delivery: body NOT embedded -> 0 embedded bytes, full touched.
+        path = cowork._artifact_descriptors([p], delivery="path")
+        self.assertEqual(path[0]["delivery"], "path")
+        self.assertEqual(path[0]["embedded_bytes"], 0)
+        self.assertEqual(path[0]["bytes"], full)
+        # explicit per-path embedded map wins (e.g. a diff chunk size).
+        diff = cowork._artifact_descriptors(
+            [p], delivery="diff", embedded={p: 17})
+        self.assertEqual(diff[0]["delivery"], "diff")
+        self.assertEqual(diff[0]["embedded_bytes"], 17)
+
+    def test_full_reread_packet_is_path_delivery_small_embedded(self):
+        p = self._file('{"finding": "SECRET-BODY"}' + " " * 500)
+        pkt = diffpacket.build_full_reread_packet(
+            [{"label": "intel", "path": p, "kind": "json"}])
+        self.assertEqual(pkt.delivery, "path")
+        self.assertNotIn("SECRET-BODY", pkt)            # body not embedded
+        self.assertIn(p, pkt)                           # path referenced
+        # embedded bytes ~ the descriptor line, far below the full body.
+        self.assertIn(p, pkt.embedded)
+        self.assertLess(pkt.embedded[p], os.path.getsize(p))
+
+    def test_report_path_delivery_excludes_embedded_total(self):
+        # A path-delivered artifact contributes its FULL size to "touched" but
+        # 0 to the embedded total; an embedded one contributes its full body.
+        s = cowork_report.summarize_trace([
+            {"event": "controller.turn.start", "role": "build-reviewer",
+             "controller": "claude", "prompt_kind": "reviewer_pass",
+             "prompt_bytes": 200, "resume": True,
+             "artifacts": [{"path": "plan.json", "bytes": 900,
+                            "delivery": "path", "embedded_bytes": 0}]},
+            {"event": "controller.turn.start", "role": "scout",
+             "controller": "codex", "prompt_kind": "role_seed",
+             "prompt_bytes": 100, "fresh": True,
+             "artifacts": [{"path": "intel.json", "bytes": 300,
+                            "delivery": "embedded", "embedded_bytes": 300}]},
+        ])
+        self.assertEqual(s["artifact_bytes"]["plan.json"]["bytes"], 900)
+        self.assertEqual(s["artifact_bytes"]["plan.json"]["embedded"], 0)
+        self.assertEqual(s["delivery_breakdown"]["path"]["touched"], 900)
+        self.assertEqual(s["delivery_breakdown"]["path"]["embedded"], 0)
+        self.assertEqual(s["delivery_breakdown"]["embedded"]["embedded"], 300)
+        text = cowork_report.render_report(s)
+        self.assertIn("touched 900 B", text)
+        self.assertIn("embedded 0 B", text)
+
+    def test_report_role_prompt_bytes_section(self):
+        s = cowork_report.summarize_trace([
+            {"event": "role.prompt.bytes", "role": "planner",
+             "bytes": 12000, "delivery": "codex_inline"},
+            {"event": "role.prompt.bytes", "role": "scout-reviewer",
+             "bytes": 9000, "delivery": "claude_system"},
+            {"event": "role.prompt.bytes", "role": "planner",
+             "bytes": 12000, "delivery": "codex_inline"},
+            {"event": "controller.turn.start", "role": "planner",
+             "controller": "codex", "prompt_kind": "role_seed",
+             "prompt_bytes": 500, "fresh": True},
+        ])
+        rp = s["role_prompt_bytes"]
+        self.assertEqual(rp[("planner", "codex_inline")]["bytes"], 24000)
+        self.assertEqual(rp[("planner", "codex_inline")]["launches"], 2)
+        self.assertEqual(rp[("scout-reviewer", "claude_system")]["bytes"], 9000)
+        text = cowork_report.render_report(s)
+        self.assertIn("Role/system-prompt bytes by role", text)
+        self.assertIn("codex_inline", text)
+        self.assertIn("claude_system", text)
 
 
 class ProbeCacheTest(unittest.TestCase):
@@ -9213,6 +9346,17 @@ class ReviewerPacketContextTest(unittest.TestCase):
         self.assertNotIn("VALUE-IN-JSON", out)   # body not embedded
         self.assertNotIn("MD-BODY", out)
         self.assertIn(self.pj, out)              # path present
+        # #3: the returned block carries its delivery so run_reviewer_once can
+        # tag descriptors truthfully without re-inferring the packet form.
+        self.assertEqual(getattr(out, "delivery", None), "path")
+
+    def test_t10_advisor_no_packet_ctx_is_embedded_delivery(self):
+        # Legacy full-embed fallback (no packet_ctx): bodies are embedded and
+        # the block reports the "embedded" delivery (a plain str -> default).
+        out = cowork.assemble_advisor_context(
+            "ctx", ["planner", "planning-advisor"], self.pj, self.pm)
+        self.assertIn("VALUE-IN-JSON", out)      # body embedded
+        self.assertEqual(getattr(out, "delivery", "embedded"), "embedded")
 
     def test_t9_build_reviewer_packet_keeps_live_delta_recipe(self):
         out = cowork.assemble_build_reviewer_resume_context(
@@ -9237,6 +9381,9 @@ class ReviewerPacketContextTest(unittest.TestCase):
         self.assertIn(diffpacket.DIFF_INSTRUCTION, out)
         self.assertIn("CHANGED-STATUS", out)     # diff shows the new line
         self.assertIn("FULL working-tree delta", out)
+        # #3: a repeat round emits a diff -> the block reports "diff" delivery
+        # even after the context-update wake block is prepended.
+        self.assertEqual(getattr(out, "delivery", None), "diff")
 
 
 class TurnMetaWiringTest(unittest.TestCase):
@@ -9278,8 +9425,13 @@ class TurnMetaWiringTest(unittest.TestCase):
         self.assertFalse(m["resume"])
         self.assertEqual(m["context_revision"], 3)
         paths = [a["path"] for a in m["artifacts"]]
-        self.assertIn(intel, paths)    # seed artifact embedded on first send
+        self.assertIn(intel, paths)    # seed artifact referenced on first send
         self.assertIn(status, paths)   # role's own status file
+        # #1/#3: lead seeds are path-first now — no body rides, so every lead
+        # artifact is tagged "path" with 0 embedded bytes.
+        for a in m["artifacts"]:
+            self.assertEqual(a["delivery"], "path")
+            self.assertEqual(a["embedded_bytes"], 0)
 
     def test_lead_meta_resumed_launch_marks_resume(self):
         d = self._dir()
@@ -9335,6 +9487,71 @@ class TurnMetaWiringTest(unittest.TestCase):
         self.assertEqual(m["context_revision"], 4)
         # The FULL embedded artifact set is described, not just the primary path.
         self.assertEqual([a["path"] for a in m["artifacts"]], [intel, md])
+        # No snapshot_dir wired -> legacy full-embed -> "embedded" delivery,
+        # embedded_bytes == full body bytes.
+        for a in m["artifacts"]:
+            self.assertEqual(a["delivery"], "embedded")
+            self.assertEqual(a["embedded_bytes"], a["bytes"])
+
+    def test_reviewer_meta_delivery_is_derived_from_packet(self):
+        # #3 KEY: with a snapshot_dir wired the reviewer pass is path-first on a
+        # fresh send, and a diff on a repeat round against the same key — the
+        # meta delivery is DERIVED from the packet ctx_block actually carried,
+        # never a static 'embedded' default.
+        d = self._dir()
+        snap = os.path.join(d, "snap")
+        os.makedirs(snap)
+        intel = os.path.join(d, "intel.json")
+        md = os.path.join(d, "intel.md")
+        review = os.path.join(d, "review.json")
+        for p, body in ((intel, '{"v": 1}'), (md, "# MD\nbody")):
+            with open(p, "w") as fh:
+                fh.write(body)
+        captured = {}
+
+        class Fake:
+            def send(self, text, meta=None):
+                captured["meta"] = meta
+
+            def close(self):
+                pass
+
+        cfg = {cowork.SCOUT_REVIEWER: {"controller": "claude",
+                                       "mode": "plan", "yolo": True}}
+
+        def run(resume_id):
+            cowork.run_reviewer_once(
+                cfg, "ctx", [cowork.SCOUT_REVIEWER], intel, review,
+                session_factory=lambda c, io: Fake(),
+                reviewer_role=cowork.SCOUT_REVIEWER,
+                context_fn=lambda ctx, sel, p, packet_ctx=None:
+                    cowork.assemble_reviewer_context(
+                        ctx, sel, p, md, packet_ctx=packet_ctx),
+                resume_context_fn=lambda p, context_update=None,
+                    packet_ctx=None, force_full_reread=False:
+                    cowork.assemble_reviewer_resume_context(
+                        p, md, context_update=context_update,
+                        packet_ctx=packet_ctx,
+                        force_full_reread=force_full_reread),
+                artifact_paths=[intel, md], phase="scouting",
+                epoch=1, context_revision=0, snapshot_dir=snap,
+                resume_id=resume_id)
+
+        run(None)  # fresh: seeds the snapshot, path-first
+        for a in captured["meta"]["artifacts"]:
+            self.assertEqual(a["delivery"], "path")
+            # ~descriptor-line size (path + hash + size), a small bounded
+            # overhead — the artifact BODY is never embedded.
+            self.assertLess(a["embedded_bytes"], 1024)
+        # Change both files, then resume against the same key -> a diff packet.
+        with open(intel, "w") as fh:
+            fh.write('{"v": 2}')
+        with open(md, "w") as fh:
+            fh.write("# MD\nbody changed")
+        run("scout-reviewer-1")
+        deliveries = {a["delivery"]
+                      for a in captured["meta"]["artifacts"]}
+        self.assertEqual(deliveries, {"diff"})
 
     def test_lead_eval_send_carries_meta(self):
         # #1 (review fix): the lead's peer-eval send (_make_evaluate_fn) goes
