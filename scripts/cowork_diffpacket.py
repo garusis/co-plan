@@ -129,25 +129,45 @@ def _store_snapshot(snapshot_dir, reviewer_role, key, files):
 def _descriptor_lines(entries):
     lines = []
     for e in entries:
-        present = "" if e["present"] else " (missing on disk)"
-        lines.append("  - %s: %s  [%d bytes, sha256 %s]%s"
-                     % (e["label"], e["path"], e["bytes"], e["sha256"][:12],
-                        present))
+        lines.append(_descriptor_line(e))
     return "\n".join(lines)
 
 
-def build_review_packet(reviewer_role, epoch, context_revision, artifacts,
-                        snapshot_dir, *, force_full_reread=False,
-                        diff_line_cap=DEFAULT_DIFF_LINE_CAP):
-    """Build the embedded-artifact block for a reviewer prompt and (re)write the
-    current snapshot.
+def _descriptor_line(e):
+    present = "" if e["present"] else " (missing on disk)"
+    return ("  - %s: %s  [%d bytes, sha256 %s]%s"
+            % (e["label"], e["path"], e["bytes"], e["sha256"][:12], present))
 
-    `artifacts` is an ordered list of dicts, each ``{"label", "path", "kind"}``
-    where kind is "json" or "markdown". Returns the block string to splice into
-    the reviewer's context where full artifact bodies used to live.
-    """
-    key = _snapshot_key(epoch, context_revision,
-                        [a["path"] for a in artifacts])
+
+class Packet(str):
+    """A path-first/diff/embedded artifact block that ALSO carries how its
+    artifacts were delivered (#3), so a caller can tag its trace descriptors
+    truthfully without re-inferring the packet form. Transparent as a plain
+    `str` (formatting/concatenation produce a normal str), so every existing
+    string consumer keeps working unchanged.
+
+    - ``delivery`` is "path" (full-reread), "diff", or "embedded".
+    - ``embedded`` maps each artifact path to the BYTES that artifact actually
+      contributes to the prompt: the descriptor line for a path packet, the
+      descriptor line + that artifact's diff chunk for a diff packet. The full
+      artifact body is never embedded in a path/diff packet, so those byte
+      counts stay small — the report sums them as "embedded prompt bytes",
+      distinct from the full "artifact size touched"."""
+
+    def __new__(cls, text, *, delivery="path", embedded=None):
+        obj = super().__new__(cls, text)
+        obj.delivery = delivery
+        obj.embedded = dict(embedded or {})
+        return obj
+
+
+def _descriptor_entries(artifacts):
+    """Read each artifact once and build its content-free descriptor entry
+    (label, path, kind, bytes, sha256, present, canonical). Shared by the
+    full-reread and diff/review packet builders. Returns
+    ``(entries, current_canon, canon_failed)`` where current_canon maps each
+    path to its canonical text (used for diffing) and canon_failed is True when
+    any present artifact failed JSON canonicalization."""
     entries = []
     current_canon = {}
     canon_failed = False
@@ -170,6 +190,51 @@ def build_review_packet(reviewer_role, epoch, context_revision, artifacts,
             "canonical": canon,
         })
         current_canon[path] = canon
+    return entries, current_canon, canon_failed
+
+
+def _full_reread_embedded(entries):
+    """Per-path embedded byte map for a full-reread packet: each artifact
+    contributes only its descriptor line to the prompt (its body is NOT
+    embedded), so the count stays small."""
+    return {e["path"]: len(_descriptor_line(e).encode("utf-8")) for e in entries}
+
+
+DEFAULT_FULL_REREAD_HEADER = (
+    "Authoritative artifacts (current files on disk — the source of truth):")
+
+
+def build_full_reread_packet(artifacts, header_label=None):
+    """Build a path-first FULL-REREAD packet (descriptor lines + a read-from-disk
+    instruction, NO snapshot and NO diff) for a lead-role seed/wake or a
+    consumed-upstream eval (#1/#2). `artifacts` is an ordered list of
+    ``{"label", "path", "kind"}`` dicts.
+
+    Returns a `Packet` (a `str` subclass) whose ``.delivery`` is "path" and
+    whose ``.embedded`` maps each path to its descriptor-line bytes — the only
+    bytes it adds to the prompt. Tolerant: a missing file degrades to a
+    "(missing on disk)" descriptor, never raises."""
+    entries, _, _ = _descriptor_entries(artifacts)
+    header = "%s\n%s" % (header_label or DEFAULT_FULL_REREAD_HEADER,
+                         _descriptor_lines(entries))
+    block = "%s\n\n%s" % (header, FULL_REREAD_INSTRUCTION)
+    return Packet(block, delivery="path",
+                  embedded=_full_reread_embedded(entries))
+
+
+def build_review_packet(reviewer_role, epoch, context_revision, artifacts,
+                        snapshot_dir, *, force_full_reread=False,
+                        diff_line_cap=DEFAULT_DIFF_LINE_CAP):
+    """Build the embedded-artifact block for a reviewer prompt and (re)write the
+    current snapshot.
+
+    `artifacts` is an ordered list of dicts, each ``{"label", "path", "kind"}``
+    where kind is "json" or "markdown". Returns the block string to splice into
+    the reviewer's context where full artifact bodies used to live.
+    """
+    key = _snapshot_key(epoch, context_revision,
+                        [a["path"] for a in artifacts])
+    entries, current_canon, canon_failed = _descriptor_entries(artifacts)
 
     prior = _load_snapshot(snapshot_dir, reviewer_role, key)
 
@@ -185,6 +250,7 @@ def build_review_packet(reviewer_role, epoch, context_revision, artifacts,
     if use_diff and any(e["path"] not in prior for e in entries):
         use_diff = False
     diff_text = None
+    diff_by_path = {}
     if use_diff:
         chunks = []
         for e in entries:
@@ -193,6 +259,7 @@ def build_review_packet(reviewer_role, epoch, context_revision, artifacts,
             after = (e["canonical"] or "").splitlines(keepends=True)
             d = list(difflib.unified_diff(
                 before, after, fromfile="a/%s" % path, tofile="b/%s" % path))
+            diff_by_path[path] = "".join(d)
             chunks.extend(d)
         if len(chunks) > diff_line_cap:
             use_diff = False  # too large/noisy → full reread
@@ -204,6 +271,14 @@ def build_review_packet(reviewer_role, epoch, context_revision, artifacts,
 
     if use_diff:
         body = diff_text if diff_text.strip() else "(no changes since your last review)"
-        return ("%s\n\n%s\n\nDeterministic unified diff since your last review:\n"
-                "%s" % (header, DIFF_INSTRUCTION, body))
-    return "%s\n\n%s" % (header, FULL_REREAD_INSTRUCTION)
+        block = ("%s\n\n%s\n\nDeterministic unified diff since your last review:\n"
+                 "%s" % (header, DIFF_INSTRUCTION, body))
+        # Diff packet: each artifact contributes its descriptor line plus its
+        # own diff chunk to the prompt (never the full body).
+        embedded = {e["path"]: len(_descriptor_line(e).encode("utf-8"))
+                    + len((diff_by_path.get(e["path"]) or "").encode("utf-8"))
+                    for e in entries}
+        return Packet(block, delivery="diff", embedded=embedded)
+    block = "%s\n\n%s" % (header, FULL_REREAD_INSTRUCTION)
+    return Packet(block, delivery="path",
+                  embedded=_full_reread_embedded(entries))

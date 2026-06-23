@@ -575,6 +575,22 @@ def assemble_codex_prompt(role_text, team_note, context):
     return "\n\n".join([role_text.strip(), team_note.strip(), context.strip()]).strip()
 
 
+def _emit_codex_role_prompt_bytes(trace, role, role_text):
+    """Item #4 measurement: record the static role-markdown bytes inlined into a
+    FRESH Codex prompt body (`assemble_codex_prompt` prepends `role_text`), as a
+    dedicated `role.prompt.bytes` event tagged `role_prompt_delivery=codex_inline`.
+
+    This is the static role/system-prompt cost, kept SEPARATE from the per-turn
+    user-message `prompt_bytes` (which, for Codex, silently folds the role text
+    in today). Emitted at every codex launch that actually inlines the role —
+    the pure string builder has no trace handle, so each launch site calls this.
+    No-op without a trace handle or role text."""
+    if trace and role_text:
+        trace.event("role.prompt.bytes", role=role,
+                    bytes=len(role_text.encode("utf-8")),
+                    delivery="codex_inline")
+
+
 # --------------------------------------------------------------------------- #
 # scout-reviewer: a critical reviewer paired with the scout. Invoked            #
 # deterministically when the scout sets `ready_for_review`. It shares the       #
@@ -637,10 +653,20 @@ def _send(session, text, meta=None):
                                   error_type=type(exc).__name__)
 
 
-def _artifact_descriptors(paths):
-    """Content-free per-file accounting (#1/D11): [{path, bytes, sha256}] over
-    the existing files in `paths`, in order. Missing files are skipped. Returns
-    None when nothing is present (Trace.event drops a None field)."""
+def _artifact_descriptors(paths, delivery="embedded", embedded=None):
+    """Content-free per-file accounting (#1/D11, #3): one
+    ``{path, bytes, sha256, delivery, embedded_bytes}`` per existing file in
+    `paths`, in order. Missing files are skipped. Returns None when nothing is
+    present (Trace.event drops a None field).
+
+    `delivery` is how these artifacts were sent — "embedded" (full body inline,
+    the legacy default), "path" (path-first full-reread), or "diff". `embedded`
+    optionally maps a path to the BYTES it actually contributed to the prompt
+    (descriptor line, or descriptor + diff chunk); when absent, an embedded
+    delivery counts the full body and a path/diff delivery counts 0. This lets
+    the report separate "artifact size touched" (`bytes`) from "bytes actually
+    embedded in the prompt" (`embedded_bytes`)."""
+    embedded = embedded or {}
     out = []
     for path in paths or []:
         if not path:
@@ -650,8 +676,16 @@ def _artifact_descriptors(paths):
                 raw = fh.read()
         except OSError:
             continue
-        out.append({"path": path, "bytes": len(raw),
-                    "sha256": hashlib.sha256(raw).hexdigest()})
+        size = len(raw)
+        if path in embedded:
+            emb = embedded[path]
+        elif delivery == "embedded":
+            emb = size
+        else:
+            emb = 0
+        out.append({"path": path, "bytes": size,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "delivery": delivery, "embedded_bytes": emb})
     return out or None
 
 
@@ -690,13 +724,31 @@ def _review_packet(packet_ctx, artifacts, force_full_reread=False):
     """Build the path-first embedded-artifact block via the diff-packet helper
     (#4). `packet_ctx` carries {reviewer_role, epoch, context_revision,
     snapshot_dir}; returns None when packet_ctx is absent (legacy full-embed
-    callers fall back to embedding bodies)."""
+    callers fall back to embedding bodies). The returned value is a
+    diffpacket.Packet (a str subclass) carrying its delivery mode + per-path
+    embedded bytes (#3)."""
     if not packet_ctx:
         return None
     return diffpacket.build_review_packet(
         packet_ctx["reviewer_role"], packet_ctx["epoch"],
         packet_ctx["context_revision"], artifacts, packet_ctx["snapshot_dir"],
         force_full_reread=force_full_reread)
+
+
+def _carry_delivery(text, src):
+    """Wrap an assembled reviewer-context string so its caller can read how the
+    embedded artifacts were actually delivered (#3) without re-inferring the
+    packet form. `src` is the diffpacket.Packet the assembler spliced in (or an
+    already-wrapped body being re-prefixed with a context-update block);
+    delivery + per-path embedded bytes are copied off it. When `src` carries no
+    delivery (a legacy full-embed body — a plain str), the text is returned
+    unwrapped, so a caller reading getattr(block, "delivery", "embedded") sees
+    "embedded" there. Transparent as a plain str either way."""
+    delivery = getattr(src, "delivery", None)
+    if delivery is None:
+        return text
+    return diffpacket.Packet(text, delivery=delivery,
+                             embedded=getattr(src, "embedded", None))
 
 
 def assemble_reviewer_context(context, selected, intel_path, intel_md_path=None,
@@ -721,13 +773,12 @@ def assemble_reviewer_context(context, selected, intel_path, intel_md_path=None,
         packet_ctx, _intel_artifacts(intel_path, intel_md_path),
         force_full_reread=True)
     if packet is not None:
-        return (
+        return _carry_delivery(
             "Shared initial context — this is the SAME context the scout was "
             "given:\n%s\n\n"
             "Team on this session: %s\n\n"
             "Review the scout's current intel critically against the context "
-            "above.\n\n%s" % (context.strip(), team, packet)
-        )
+            "above.\n\n%s" % (context.strip(), team, packet), packet)
     intel_text = _read_text(intel_path)
     if intel_md_path:
         return (
@@ -1021,9 +1072,12 @@ def _consumed_upstream_spec(consumed, scores_path, evaluator, round_index):
     Skips (None) when: there is no consumed-upstream wiring, it is not the
     first eval turn of the phase (the bundle rides round 1 only), the
     (evaluator, evaluatee) pair is not in EVAL_CRITERIA, or any consumed
-    artifact file is missing. The embedded evidence is the concatenation of
-    the consumed artifact files, read at eval time, so the prompt is
-    self-contained."""
+    artifact file is missing. The evidence is a path-first FULL-REREAD packet
+    over the consumed artifact files (#2 — paths/hashes/sizes + a read-from-disk
+    instruction, NOT the embedded bodies), so the prompt stays self-contained
+    without moving the large bodies through it. The provenance
+    `artifact_sha256` is still computed by reading the files at eval time (hash
+    only, never embedded)."""
     if not consumed or round_index != 1:
         return None
     evaluatee = consumed["role"]
@@ -1042,10 +1096,19 @@ def _consumed_upstream_spec(consumed, scores_path, evaluator, round_index):
             else None):
         return "deduped"
     text = "\n\n".join(_read_text(p).strip() for p in paths)
+    label = consumed.get("label") or "upstream artifact"
+    arts = [{"label": label, "path": p,
+             "kind": "json" if str(p).endswith(".json") else "markdown"}
+            for p in paths]
+    packet = diffpacket.build_full_reread_packet(
+        arts,
+        header_label="The %s this phase consumed (current files on disk — the "
+                     "authoritative source of truth; read them before scoring):"
+                     % label)
     spec = {
         "evaluatee": evaluatee,
         "criteria": EVAL_CRITERIA[(evaluator, evaluatee)],
-        "artifact_block": consumed["embed"] % text,
+        "artifact_block": packet,
         "context": consumed["context"],
         "epoch_field": epoch_field,
         "epoch_value": epoch_value,
@@ -1212,10 +1275,13 @@ def _make_evaluate_fn(role, reviewer_role, phase, scratch_path, scores_path,
         # JSON+md for the builder eval), and only when it rides this turn
         # (len(specs) > 1). The scratch file is the eval's OUTPUT target (cleared
         # above), so it is never an embedded artifact.
+        # The consumed-upstream bundle now rides path-first (#2), so its
+        # artifact files are referenced by path, not embedded — tag the
+        # descriptors accordingly so the report does not over-count them.
         eval_artifacts = None
         if len(specs) > 1:
             eval_artifacts = _artifact_descriptors(
-                consumed_upstream.get("artifact_paths"))
+                consumed_upstream.get("artifact_paths"), delivery="path")
         with _muted_session(session):
             _send(session, prompt, meta={
                 "prompt_kind": "eval", "fresh": False, "resume": True,
@@ -1260,10 +1326,10 @@ def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
         packet_ctx, _intel_artifacts(intel_path, intel_md_path),
         force_full_reread=force_full_reread)
     if packet is not None:
-        body = (
+        body = _carry_delivery(
             "The scout has updated its intel since your last review. Re-review "
             "against the current task context and write your verdict to the "
-            "review file again.\n\n%s" % packet)
+            "review file again.\n\n%s" % packet, packet)
     elif intel_md_path:
         body = (
             "The scout has updated its intel since your last review. Re-review "
@@ -1283,7 +1349,8 @@ def assemble_reviewer_resume_context(intel_path, intel_md_path=None,
             % _read_text(intel_path).strip()
         )
     if context_update:
-        return context_update_block(context_update) + "\n\n" + body
+        return _carry_delivery(
+            context_update_block(context_update) + "\n\n" + body, body)
     return body
 
 
@@ -1349,26 +1416,36 @@ def assemble_planner_brief(plan_json_path, plan_md_path, caveman_available=None)
 
 
 def assemble_planner_seed(intel_path, context):
-    """The fresh planner's situational context: the approved scout intel
-    (verbatim JSON) plus the current shared session context."""
+    """The fresh planner's situational context: a path-first FULL-REREAD packet
+    for the approved scout intel (#1 — the body is read from disk, not embedded)
+    plus the current shared session context. The artifact SET (intel JSON) is
+    unchanged; only the delivery is path-first."""
+    packet = diffpacket.build_full_reread_packet(
+        _intel_artifacts(intel_path),
+        header_label="Approved scout intel (current file on disk — the "
+                     "authoritative source of truth):")
     return (
-        "The scout phase is complete and the user APPROVED the scout intel "
-        "below. Digest it and drive the planning conversation.\n\n"
-        "Approved scout intel:\n%s\n\n"
-        "Current shared context:\n%s" % (_read_text(intel_path).strip(),
-                                         (context or "").strip())
+        "The scout phase is complete and the user APPROVED the scout intel. "
+        "Digest it and drive the planning conversation.\n\n"
+        "%s\n\n"
+        "Current shared context:\n%s" % (packet, (context or "").strip())
     )
 
 
 def intel_updated_block(intel_path):
     """Wake block for a resumed planner after a hand-back round trip: the scout
-    re-ran its full cycle and the user approved the UPDATED intel."""
+    re-ran its full cycle and the user approved the UPDATED intel. The intel is
+    delivered path-first (#1 — read from disk, not embedded)."""
+    packet = diffpacket.build_full_reread_packet(
+        _intel_artifacts(intel_path),
+        header_label="Updated approved intel (current file on disk — the "
+                     "authoritative source of truth):")
     return (
         "The scout intel changed since you started planning: your hand-back was "
         "executed, the scout re-investigated, and the user approved the updated "
-        "intel below. Digest it and continue planning. Keep prior plan content "
+        "intel. Digest it and continue planning. Keep prior plan content "
         "only where it remains compatible.\n\n"
-        "Updated approved intel:\n%s" % _read_text(intel_path).strip()
+        "%s" % packet
     )
 
 
@@ -1438,32 +1515,38 @@ def assemble_builder_brief(build_status_path, build_summary_path=None,
 
 
 def assemble_builder_seed(plan_json_path, plan_md_path, context):
-    """The fresh builder's situational context: the approved plan (verbatim
-    JSON + markdown) plus the current shared session context."""
+    """The fresh builder's situational context: a path-first FULL-REREAD packet
+    for the approved plan (#1 — JSON + markdown read from disk, not embedded)
+    plus the current shared session context. The artifact SET (plan JSON + MD)
+    is unchanged; only the delivery is path-first."""
+    packet = diffpacket.build_full_reread_packet(
+        _plan_artifacts(plan_json_path, plan_md_path),
+        header_label="Approved plan (current files on disk — the authoritative "
+                     "source of truth):")
     return (
-        "The planning phase is complete and the user APPROVED the plan below. "
+        "The planning phase is complete and the user APPROVED the plan. "
         "Execute it: make the code changes, verify them, and drive the build "
         "conversation.\n\n"
-        "Approved plan JSON (the machine source of truth):\n%s\n\n"
-        "Approved plan markdown (the human-readable summary):\n%s\n\n"
-        "Current shared context:\n%s"
-        % (_read_text(plan_json_path).strip(), _read_text(plan_md_path).strip(),
-           (context or "").strip())
+        "%s\n\n"
+        "Current shared context:\n%s" % (packet, (context or "").strip())
     )
 
 
 def plan_updated_block(plan_json_path, plan_md_path):
     """Wake block for a resumed builder after a hand-back round trip: the
     builder handed back to the planner, the planner re-planned, and the user
-    approved the UPDATED plan."""
+    approved the UPDATED plan. The plan is delivered path-first (#1 — read from
+    disk, not embedded)."""
+    packet = diffpacket.build_full_reread_packet(
+        _plan_artifacts(plan_json_path, plan_md_path),
+        header_label="Updated approved plan (current files on disk — the "
+                     "authoritative source of truth):")
     return (
         "The plan changed since you started building: your hand-back was "
         "executed, the planner re-planned, and the user approved the UPDATED "
-        "plan below. Digest the changes and continue building. Keep prior work "
+        "plan. Digest the changes and continue building. Keep prior work "
         "only where it remains compatible.\n\n"
-        "Updated approved plan JSON:\n%s\n\n"
-        "Updated approved plan markdown:\n%s"
-        % (_read_text(plan_json_path).strip(), _read_text(plan_md_path).strip())
+        "%s" % packet
     )
 
 
@@ -1509,13 +1592,12 @@ def assemble_advisor_context(context, selected, plan_json_path, plan_md_path,
         packet_ctx, _plan_artifacts(plan_json_path, plan_md_path),
         force_full_reread=True)
     if packet is not None:
-        return (
+        return _carry_delivery(
             "Shared session context — this is the SAME context the planner was "
             "given:\n%s\n\n"
             "Team on this session: %s\n\n"
             "Review the planner's current plan critically against the context "
-            "above.\n\n%s" % (context.strip(), team, packet)
-        )
+            "above.\n\n%s" % (context.strip(), team, packet), packet)
     return (
         "Shared session context — this is the SAME context the planner was "
         "given:\n%s\n\n"
@@ -1543,10 +1625,10 @@ def assemble_advisor_resume_context(plan_json_path, plan_md_path,
         packet_ctx, _plan_artifacts(plan_json_path, plan_md_path),
         force_full_reread=force_full_reread)
     if packet is not None:
-        body = (
+        body = _carry_delivery(
             "The planner has updated its plan since your last review. Re-review "
             "against the current task context and write your verdict to the "
-            "review file again.\n\n%s" % packet)
+            "review file again.\n\n%s" % packet, packet)
     else:
         body = (
             "The planner has updated its plan since your last review. Re-review "
@@ -1558,7 +1640,8 @@ def assemble_advisor_resume_context(plan_json_path, plan_md_path,
                _read_text(plan_md_path).strip())
         )
     if context_update:
-        return context_update_block(context_update) + "\n\n" + body
+        return _carry_delivery(
+            context_update_block(context_update) + "\n\n" + body, body)
     return body
 
 
@@ -1919,8 +2002,9 @@ def run_worktree(wt_config, status_path, base_toplevel, name, explicit,
                 wt_config["mode"], wt_config["yolo"], io_out=io_out,
                 speaker=WORKTREE_ROLE, trace=trace,
                 extra_writable_dir=extra_writable_dir)
-        first = assemble_codex_prompt(
-            _read_text(WORKTREE_PROMPT_PATH), "", brief)
+        wt_role_text = _read_text(WORKTREE_PROMPT_PATH)
+        first = assemble_codex_prompt(wt_role_text, "", brief)
+        _emit_codex_role_prompt_bytes(trace, WORKTREE_ROLE, wt_role_text)
     try:
         _send(session, first, meta={"prompt_kind": "worktree_seed",
                                     "phase": "worktree"})
@@ -2149,14 +2233,14 @@ def assemble_build_reviewer_context(context, selected, plan_json_path,
             plan_json_path, plan_md_path, build_status_path, build_summary_path),
         force_full_reread=True)
     if packet is not None:
-        return (
+        return _carry_delivery(
             "Shared session context — this is the SAME context the builder was "
             "given:\n%s\n\n"
             "Team on this session: %s\n\n"
             "%s\n\n"
             "%s"
             % (context.strip(), team, packet,
-               _build_diff_recipe(baseline_repos, baseline_note)))
+               _build_diff_recipe(baseline_repos, baseline_note)), packet)
     return (
         "Shared session context — this is the SAME context the builder was "
         "given:\n%s\n\n"
@@ -2198,14 +2282,15 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
             plan_json_path, plan_md_path, build_status_path, build_summary_path),
         force_full_reread=force_full_reread)
     if packet is not None:
-        body = (
+        body = _carry_delivery(
             "The builder has updated its work since your last review. Re-review "
             "the current full working-tree delta against the plan and the "
             "builder's current status, and write your verdict to the review "
             "file again.\n\n"
             "%s\n\n"
             "%s"
-            % (packet, _build_diff_recipe(baseline_repos, baseline_note)))
+            % (packet, _build_diff_recipe(baseline_repos, baseline_note)),
+            packet)
     else:
         body = (
             "The builder has updated its work since your last review. Re-review "
@@ -2223,7 +2308,8 @@ def assemble_build_reviewer_resume_context(plan_json_path, plan_md_path,
                _build_summary_block(build_summary_path),
                _build_diff_recipe(baseline_repos, baseline_note)))
     if context_update:
-        return context_update_block(context_update) + "\n\n" + body
+        return _carry_delivery(
+            context_update_block(context_update) + "\n\n" + body, body)
     return body
 
 
@@ -2300,14 +2386,18 @@ def _run_reviewer_eval(session, reviewer_role, eval_scratch_path, eval_specs,
                     round=eval_specs[0].get("round"))
     try:
         # An eval is always a follow-up turn on the still-open reviewer session,
-        # so it is a resume; it carries the reviewed artifact + the review file.
+        # so it is a resume; it references the reviewed artifact + the review
+        # file by PATH (the reviewer-side eval specs name them as paths, and the
+        # consumed-upstream evidence rides path-first after #2), so tag the
+        # descriptors as path-first — no bodies are embedded here.
         _send(session, assemble_eval_prompt(
             reviewer_role, eval_scratch_path, eval_specs),
             meta={"prompt_kind": "eval", "fresh": False, "resume": True,
                   "phase": eval_specs[0].get("phase"),
                   "round": eval_specs[0].get("round"),
                   "context_revision": context_revision,
-                  "artifacts": _artifact_descriptors(artifact_paths)})
+                  "artifacts": _artifact_descriptors(artifact_paths,
+                                                     delivery="path")})
     except Exception:  # noqa: BLE001 - eval must never break the review pass
         if trace:
             trace.event("eval.send.error", evaluator=reviewer_role)
@@ -2355,13 +2445,47 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     surface = surface_io_out is not None
     review_io = surface_io_out if surface else quiet
     brief = assemble_reviewer_brief(review_path, protected=protected)
+    # Diff-packet context (#4): only built when a snapshot_dir is wired (the real
+    # runners pass it). packet_ctx keys the per-reviewer snapshot by phase epoch
+    # + context revision; a test runner / legacy direct call leaves it None and
+    # the assemblers fall back to embedding full bodies.
+    packet_ctx = None
+    if snapshot_dir is not None:
+        packet_ctx = {"reviewer_role": reviewer_role, "epoch": epoch,
+                      "context_revision": context_revision,
+                      "snapshot_dir": snapshot_dir}
+    # Build the reviewer context FIRST (before the trace + accounting) so the
+    # delivery the packet actually chose — path / diff / embedded — is known and
+    # can tag every descriptor truthfully (#3). The form is dynamic: a resumed
+    # reviewer with a prior snapshot may get a diff; a fresh/legacy one gets a
+    # full-reread or (no packet_ctx) the embedded fallback. ctx_block is a
+    # diffpacket.Packet carrying .delivery + per-path .embedded when a packet
+    # rode, else a plain str (delivery defaults to "embedded").
+    if resume_id:
+        ctx_block = (resume_context_fn or assemble_reviewer_resume_context)(
+            intel_path, context_update=context_update, packet_ctx=packet_ctx,
+            force_full_reread=force_full_reread)
+    else:
+        ctx_block = (context_fn or assemble_reviewer_context)(
+            context, selected, intel_path, packet_ctx=packet_ctx)
+    # Per-turn accounting (#1/D11) merged into the bridge's controller.turn.start:
+    # what kind of prompt, fresh-vs-resume, the FULL reviewed artifact-set
+    # descriptors (every embedded artifact, not just the primary path) tagged by
+    # the delivery ctx_block actually used, the phase, and the context revision.
+    # role/controller are set by the bridge itself. The single review_artifacts
+    # value is reused across the fresh AND resume sends and all run.start/run.end
+    # traces — one truthful delivery tag for the whole pass.
+    meta_artifact_paths = artifact_paths or [intel_path]
+    review_delivery = getattr(ctx_block, "delivery", "embedded")
+    review_embedded = getattr(ctx_block, "embedded", None)
+    review_artifacts = _artifact_descriptors(
+        meta_artifact_paths, delivery=review_delivery, embedded=review_embedded)
     if trace:
         trace.event("review.run.start", role=reviewer_role,
                     controller=cfg["controller"], resume=bool(resume_id),
                     fresh=not bool(resume_id), prompt_kind="reviewer_pass",
                     phase=phase, epoch=epoch, context_revision=context_revision,
-                    artifacts=_artifact_descriptors(
-                        artifact_paths or [intel_path]),
+                    artifacts=review_artifacts,
                     intel_path=intel_path, review_path=review_path,
                     context_update=bool(context_update))
     # The review file is per-pass output, not durable state: clear any previous
@@ -2375,27 +2499,6 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                         review_path=review_path)
     except OSError:
         pass
-    # Diff-packet context (#4): only built when a snapshot_dir is wired (the real
-    # runners pass it). packet_ctx keys the per-reviewer snapshot by phase epoch
-    # + context revision; a test runner / legacy direct call leaves it None and
-    # the assemblers fall back to embedding full bodies.
-    packet_ctx = None
-    if snapshot_dir is not None:
-        packet_ctx = {"reviewer_role": reviewer_role, "epoch": epoch,
-                      "context_revision": context_revision,
-                      "snapshot_dir": snapshot_dir}
-    if resume_id:
-        ctx_block = (resume_context_fn or assemble_reviewer_resume_context)(
-            intel_path, context_update=context_update, packet_ctx=packet_ctx,
-            force_full_reread=force_full_reread)
-    else:
-        ctx_block = (context_fn or assemble_reviewer_context)(
-            context, selected, intel_path, packet_ctx=packet_ctx)
-    # Per-turn accounting (#1/D11) merged into the bridge's controller.turn.start:
-    # what kind of prompt, fresh-vs-resume, the FULL reviewed artifact-set
-    # descriptors (every embedded artifact, not just the primary path), the phase,
-    # and the context revision. role/controller are set by the bridge itself.
-    meta_artifact_paths = artifact_paths or [intel_path]
     review_meta = {
         "prompt_kind": "reviewer_pass",
         "phase": phase,
@@ -2403,7 +2506,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
         "resume": bool(resume_id),
         "epoch": epoch,
         "context_revision": context_revision,
-        "artifacts": _artifact_descriptors(meta_artifact_paths),
+        "artifacts": review_artifacts,
     }
 
     if cfg["controller"] == "claude":
@@ -2435,8 +2538,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                                 epoch=epoch, context_revision=context_revision,
                                 fresh=not bool(resume_id),
                                 resume=bool(resume_id),
-                                artifacts=_artifact_descriptors(
-                                    meta_artifact_paths))
+                                artifacts=review_artifacts)
                 return verdict
             # Pin a known id up front so it is resumable even if killed early.
             sid = str(uuid.uuid4())
@@ -2464,7 +2566,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                         prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
                         context_revision=context_revision,
                         fresh=not bool(resume_id), resume=bool(resume_id),
-                        artifacts=_artifact_descriptors(meta_artifact_paths))
+                        artifacts=review_artifacts)
                 return verdict
             verdict = state_store.read_review(review_path)
             # The eval send must never reach the user even when the review turn
@@ -2484,7 +2586,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                         prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
                         context_revision=context_revision,
                         fresh=not bool(resume_id), resume=bool(resume_id),
-                        artifacts=_artifact_descriptors(meta_artifact_paths))
+                        artifacts=review_artifacts)
         return verdict
 
     # codex (default)
@@ -2492,7 +2594,9 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
     if resume_id:
         prompt = (brief + "\n\n" + ctx_block).strip()  # thread already has role
     else:
-        prompt = assemble_codex_prompt(_read_text(prompt_path), brief, ctx_block)
+        reviewer_role_text = _read_text(prompt_path)
+        prompt = assemble_codex_prompt(reviewer_role_text, brief, ctx_block)
+        _emit_codex_role_prompt_bytes(trace, reviewer_role, reviewer_role_text)
     if session_factory:
         session = session_factory("codex", review_io)
     else:
@@ -2516,7 +2620,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                     prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
                     context_revision=context_revision,
                     fresh=not bool(resume_id), resume=bool(resume_id),
-                    artifacts=_artifact_descriptors(meta_artifact_paths))
+                    artifacts=review_artifacts)
             return verdict
         verdict = state_store.read_review(review_path)
         # Keep the eval send muted even when the review turn is surfaced.
@@ -2535,7 +2639,7 @@ def run_reviewer_once(config, context, selected, intel_path, review_path,
                     prompt_kind="reviewer_pass", phase=phase, epoch=epoch,
                     context_revision=context_revision,
                     fresh=not bool(resume_id), resume=bool(resume_id),
-                    artifacts=_artifact_descriptors(meta_artifact_paths))
+                    artifacts=review_artifacts)
     return verdict
 
 
@@ -3107,10 +3211,13 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 lead_kind = "role_seed"
             else:
                 lead_kind = "role_turn"
-            # The seed prompt embeds the upstream artifact(s) (planner: approved
-            # intel; builder: approved plan) on the first send only; every send
-            # also touches the role's own status file. fresh-vs-resume: the first
-            # send of a non-resumed launch is fresh; a resumed launch and every
+            # The seed prompt references the upstream artifact(s) (planner:
+            # approved intel; builder: approved plan) path-first on the first
+            # send only (#1 — the bodies are read from disk, not embedded);
+            # every send also touches the role's own status file (its write
+            # target, never embedded). So no artifact body rides a lead send:
+            # tag all lead artifacts path-first. fresh-vs-resume: the first send
+            # of a non-resumed launch is fresh; a resumed launch and every
             # continuation turn are resume turns.
             first_send = pending is first
             lead_artifacts = list(seed_artifact_paths or []) if first_send else []
@@ -3121,7 +3228,8 @@ def _role_loop(session, first, status_path, context, io_in, io_out,
                 "fresh": first_send and not is_resume,
                 "resume": is_resume or not first_send,
                 "context_revision": context_revision,
-                "artifacts": _artifact_descriptors(lead_artifacts),
+                "artifacts": _artifact_descriptors(lead_artifacts,
+                                                   delivery="path"),
             }
             if trace:
                 trace.event("role.fingerprint.before", role=role,
@@ -4042,6 +4150,7 @@ def run_scout(config, context, selected, io_in=None, io_out=None,
 
     role_text = read_scout_prompt()
     prompt = assemble_codex_prompt(role_text, brief, context)
+    _emit_codex_role_prompt_bytes(trace, "scout", role_text)
     if resume_id:
         io_out.write("cowork: resuming codex session %s\n" % resume_id)
     cb = (lambda i: on_session("codex", i)) if on_session else None
@@ -4220,6 +4329,10 @@ def run_planner(config, context, selected, io_in=None, io_out=None,
     if resume_id:
         io_out.write("cowork: resuming codex session %s\n" % resume_id)
         prompt = (brief + "\n\n" + context).strip()  # thread already has role
+    else:
+        # Role text is inlined into the fresh prompt body only (the resume
+        # branch drops it); measure it there (#4).
+        _emit_codex_role_prompt_bytes(trace, "planner", role_text)
     cb = (lambda i: on_session("codex", i)) if on_session else None
     if session_factory:
         session = session_factory("codex", resume_thread_id=resume_id,
@@ -4401,6 +4514,10 @@ def run_builder(config, context, selected, io_in=None, io_out=None,
     if resume_id:
         io_out.write("cowork: resuming codex session %s\n" % resume_id)
         prompt = (brief + "\n\n" + context).strip()  # thread already has role
+    else:
+        # Role text is inlined into the fresh prompt body only (the resume
+        # branch drops it); measure it there (#4).
+        _emit_codex_role_prompt_bytes(trace, "builder", role_text)
     cb = (lambda i: on_session("codex", i)) if on_session else None
     if session_factory:
         session = session_factory("codex", resume_thread_id=resume_id,

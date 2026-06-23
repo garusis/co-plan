@@ -552,6 +552,19 @@ class ClaudeSession:
                 yolo=yolo, cwd=os.getcwd(), role_prompt_file=role_prompt_file,
                 session_id=session_id, resume_id=resume_id,
                 **trace_store.command_meta(command))
+            # Item #4 measurement: the static role markdown loaded via
+            # --append-system-prompt-file is a SYSTEM prompt — outside the
+            # per-turn user-message prompt_bytes. Record its size separately,
+            # tagged role_prompt_delivery='claude_system', once per spawn. This
+            # single emission covers BOTH lead and reviewer Claude launches
+            # (every ClaudeSession passes role_prompt_file through here).
+            try:
+                rp_bytes = os.path.getsize(role_prompt_file)
+            except OSError:
+                rp_bytes = None
+            if rp_bytes is not None:
+                self.trace.event("role.prompt.bytes", role=speaker,
+                                 bytes=rp_bytes, delivery="claude_system")
         try:
             self.proc = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

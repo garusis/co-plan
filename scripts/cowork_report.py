@@ -61,7 +61,12 @@ def summarize_trace(source):
     bytes_by_kind = {}
     fresh_resume = {"fresh": 0, "resume": 0, "unknown": 0}
     largest = []  # list of (bytes, role, controller, kind, round)
-    artifact_bytes = {}  # path -> {"bytes": int, "turns": int}
+    # path -> {"bytes": touched, "embedded": embedded, "turns": int}
+    artifact_bytes = {}
+    # delivery -> {"turns", "embedded", "touched"} (#3): how artifacts were sent
+    delivery_breakdown = {}
+    # (role, delivery) -> {"bytes", "launches"} (#4): static role/system prompt
+    role_prompt_bytes = {}
     review_skips = []  # list of {role, reason}
     usage_by_controller = {}  # controller -> {token field -> sum}
     turn_count = 0
@@ -91,9 +96,37 @@ def summarize_trace(source):
                 path = art.get("path")
                 if not path:
                     continue
-                entry = artifact_bytes.setdefault(path, {"bytes": 0, "turns": 0})
-                entry["bytes"] += _as_int(art.get("bytes"))
+                touched = _as_int(art.get("bytes"))
+                delivery = art.get("delivery") or "embedded"
+                # "Bytes actually embedded in the prompt" (#3): explicit when the
+                # descriptor carries it; else the full body for an embedded
+                # delivery, 0 for a path/diff reference (body not inlined).
+                emb = art.get("embedded_bytes")
+                if emb is None:
+                    emb = touched if delivery == "embedded" else 0
+                else:
+                    emb = _as_int(emb)
+                entry = artifact_bytes.setdefault(
+                    path, {"bytes": 0, "embedded": 0, "turns": 0})
+                entry["bytes"] += touched
+                entry["embedded"] += emb
                 entry["turns"] += 1
+                db = delivery_breakdown.setdefault(
+                    delivery, {"turns": 0, "embedded": 0, "touched": 0})
+                db["turns"] += 1
+                db["embedded"] += emb
+                db["touched"] += touched
+        elif name == "role.prompt.bytes":
+            # Item #4: static role/system-prompt cost, separate from per-turn
+            # user-message prompt_bytes. Tagged by delivery (claude_system vs
+            # codex_inline).
+            rp_role = obj.get("role") or "(unknown)"
+            rp_delivery = obj.get("delivery") or "(unknown)"
+            rp_key = (rp_role, rp_delivery)
+            rp = role_prompt_bytes.setdefault(
+                rp_key, {"bytes": 0, "launches": 0})
+            rp["bytes"] += _as_int(obj.get("bytes"))
+            rp["launches"] += 1
         elif name in ("controller.turn.end", "controller.probe.end"):
             # Controller-reported usage rides turn ends and probe ends alike
             # (#1 adds best-effort usage to the probe result); aggregate both.
@@ -119,6 +152,8 @@ def summarize_trace(source):
         "fresh_resume": fresh_resume,
         "largest_prompts": largest[:10],
         "artifact_bytes": artifact_bytes,
+        "delivery_breakdown": delivery_breakdown,
+        "role_prompt_bytes": role_prompt_bytes,
         "review_skips": review_skips,
         "usage_by_controller": usage_by_controller,
     }
@@ -172,14 +207,47 @@ def render_report(summary, session_uuid=None):
     lines.append("")
 
     lines.append("Artifact contribution by file (summed over turns sent):")
+    lines.append("  (touched = full artifact size; embedded = bytes actually "
+                 "inlined in the prompt)")
     rows = sorted(summary["artifact_bytes"].items(),
                   key=lambda kv: kv[1]["bytes"], reverse=True)
     if rows:
         for path, entry in rows:
-            lines.append("  %-10s x%-3d %s"
-                         % (_fmt_bytes(entry["bytes"]), entry["turns"], path))
+            lines.append(
+                "  touched %-10s embedded %-10s x%-3d %s"
+                % (_fmt_bytes(entry["bytes"]),
+                   _fmt_bytes(entry.get("embedded", 0)),
+                   entry["turns"], path))
     else:
         lines.append("  (no artifact descriptors recorded)")
+    lines.append("")
+
+    delivery = summary.get("delivery_breakdown") or {}
+    lines.append("Artifact delivery breakdown (how artifacts reached prompts):")
+    if delivery:
+        rows = sorted(delivery.items(),
+                      key=lambda kv: kv[1]["embedded"], reverse=True)
+        for mode, d in rows:
+            lines.append(
+                "  %-9s %3d sends, touched %-10s embedded %s"
+                % (mode, d["turns"], _fmt_bytes(d["touched"]),
+                   _fmt_bytes(d["embedded"])))
+    else:
+        lines.append("  (no artifact descriptors recorded)")
+    lines.append("")
+
+    role_prompt = summary.get("role_prompt_bytes") or {}
+    lines.append("Role/system-prompt bytes by role (static, separate from "
+                 "user-message bytes):")
+    if role_prompt:
+        rows = sorted(role_prompt.items(),
+                      key=lambda kv: kv[1]["bytes"], reverse=True)
+        for (role, mode), rp in rows:
+            lines.append("  %-18s %-14s %-10s x%d"
+                         % (role, mode, _fmt_bytes(rp["bytes"]),
+                            rp["launches"]))
+    else:
+        lines.append("  (no role-prompt bytes recorded)")
     lines.append("")
 
     skips = summary["review_skips"]
